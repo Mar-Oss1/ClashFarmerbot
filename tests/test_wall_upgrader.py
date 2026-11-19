@@ -329,13 +329,13 @@ class TestWallUpgradeStrategy(unittest.TestCase):
 
 
 class TestWallUpgraderFilters(unittest.TestCase):
-    """Pruebas del filtro combinado (RSS + Permanente) para cobertura del 100%."""
+    """Pruebas de la detección real ON/OFF de filtros y la caché de sesión en RAM."""
 
     def setUp(self):
         self.mock_device = MagicMock()
-        self.mock_device.width = 1920
+        self.mock_device.width = 2400
         self.mock_device.height = 1080
-        self.mock_device.screenshot.return_value = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        self.mock_device.screenshot.return_value = np.zeros((1080, 2400, 3), dtype=np.uint8)
 
         self.mock_vision = MagicMock()
         self.upgrader = WallUpgrader(self.mock_device, self.mock_vision)
@@ -349,51 +349,97 @@ class TestWallUpgraderFilters(unittest.TestCase):
         self._patch_sleep.stop()
         self._patch_delay.stop()
 
+    def test_detect_filter_states_active_fixture(self):
+        """Verifica que detect_filter_states detecte exactamente gold=True, elixir=False, perm=True en sample_filters_active.jpg."""
+        fixture_path = os.path.join(PROJECT_ROOT, "tests", "fixtures", "sample_filters_active.jpg")
+        img = cv2.imread(fixture_path)
+        self.assertIsNotNone(img, "Fixture sample_filters_active.jpg debe cargarse")
+        states = self.upgrader.detect_filter_states(img)
+        self.assertEqual(states, {"gold": True, "elixir": False, "perm": True})
+
+    def test_detect_filter_states_off_fixture_no_false_positive_gold_coin(self):
+        """Verifica que detect_filter_states detecte todos False en sample_filters_off.jpg sin falsos positivos por la moneda de oro."""
+        fixture_path = os.path.join(PROJECT_ROOT, "tests", "fixtures", "sample_filters_off.jpg")
+        img = cv2.imread(fixture_path)
+        self.assertIsNotNone(img, "Fixture sample_filters_off.jpg debe cargarse")
+        states = self.upgrader.detect_filter_states(img)
+        self.assertEqual(states, {"gold": False, "elixir": False, "perm": False})
+
     def test_apply_filter_activates_both_rss_and_permanent(self):
         """
-        Verifica que _apply_filter busca y activa tanto el filtro de recurso
-        como el filtro permanente, garantizando la cobertura del 100%.
+        Verifica que _apply_filter detecta estado apagado y activa tanto el filtro de recurso
+        como el filtro permanente, guardando el resultado en caché.
         """
+        self.mock_device.width = 2400
+        self.mock_device.height = 1080
         self.mock_vision.find_template.return_value = (1800, 100)
-        self.mock_vision.wait_for_template.side_effect = [
-            (1500, 300),  # target_res_tpl (gold)
-            (1500, 450),  # filter_perm_off
-        ]
+
+        with patch.object(self.upgrader, "detect_filter_states", return_value={"gold": False, "elixir": False, "perm": False}):
+            self.upgrader._apply_filter("gold")
+
+        # Debe pulsar: 1. Abrir menú (1800, 100) -> 2. Botón Gold -> 3. Botón Perm -> 4. Cerrar menú (1800, 100)
+        self.assertEqual(self.mock_device.tap.call_count, 4)
+        taps = [call[0] for call in self.mock_device.tap.call_args_list]
+        self.assertEqual(taps[0], (1800, 100))
+        self.assertEqual(taps[1], (1094, 249))  # Gold
+        self.assertEqual(taps[2], (1639, 502))  # Perm
+        self.assertEqual(taps[3], (1800, 100))
+        self.assertEqual(self.upgrader._session_filters, {"gold": True, "elixir": False, "perm": True})
+
+    def test_apply_filter_elixir_and_permanent(self):
+        """Verifica la activación combinada con Elixir y Permanente."""
+        self.mock_device.width = 2400
+        self.mock_device.height = 1080
+        self.mock_vision.find_template.return_value = (1800, 100)
+
+        with patch.object(self.upgrader, "detect_filter_states", return_value={"gold": False, "elixir": False, "perm": False}):
+            self.upgrader._apply_filter("elixir")
+
+        taps = [call[0] for call in self.mock_device.tap.call_args_list]
+        self.assertEqual(taps[0], (1800, 100))
+        self.assertEqual(taps[1], (1370, 249))  # Elixir
+        self.assertEqual(taps[2], (1639, 502))  # Perm
+        self.assertEqual(taps[3], (1800, 100))
+        self.assertEqual(self.upgrader._session_filters, {"gold": False, "elixir": True, "perm": True})
+
+    def test_session_cache_skips_when_already_target_state(self):
+        """Verifica que si la sesión ya tiene el estado objetivo, no abre el menú (0 clicks)."""
+        self.upgrader._session_filters = {"gold": True, "elixir": False, "perm": True}
 
         self.upgrader._apply_filter("gold")
+
+        self.assertEqual(self.mock_device.tap.call_count, 0, "No debe ejecutar ninguna pulsación si ya está configurado")
+
+    def test_session_cache_transition_gold_to_elixir(self):
+        """
+        Verifica que al cambiar de Gold a Elixir:
+        - Abre menú
+        - Pulsa Gold (para apagarlo)
+        - Pulsa Elixir (para encenderlo)
+        - NO pulsa Perm (ya estaba encendido)
+        - Cierra menú
+        """
+        self.mock_device.width = 2400
+        self.mock_device.height = 1080
+        self.mock_vision.find_template.return_value = (1800, 100)
+        self.upgrader._session_filters = {"gold": True, "elixir": False, "perm": True}
+
+        with patch.object(self.upgrader, "detect_filter_states", return_value={"gold": True, "elixir": False, "perm": True}):
+            self.upgrader._apply_filter("elixir")
 
         self.assertEqual(self.mock_device.tap.call_count, 4)
         taps = [call[0] for call in self.mock_device.tap.call_args_list]
         self.assertEqual(taps[0], (1800, 100))
-        self.assertEqual(taps[1], (1500, 300))
-        self.assertEqual(taps[2], (1500, 450))
-        self.assertEqual(taps[3], (1800, 100))
+        self.assertEqual(taps[1], (1094, 249))  # Gold desactivar
+        self.assertEqual(taps[2], (1370, 249))  # Elixir activar
+        self.assertEqual(taps[3], (1800, 100))  # Cerrar
+        self.assertEqual(self.upgrader._session_filters, {"gold": False, "elixir": True, "perm": True})
 
-    def test_apply_filter_elixir_and_permanent(self):
-        """Verifica la activación combinada con Elixir y Permanente."""
-        self.mock_vision.find_template.return_value = (1800, 100)
-        self.mock_vision.wait_for_template.side_effect = [
-            (1500, 380),  # target_res_tpl (elixir)
-            (1500, 450),  # filter_perm_off
-        ]
-
-        self.upgrader._apply_filter("elixir")
-
-        taps = [call[0] for call in self.mock_device.tap.call_args_list]
-        self.assertEqual(taps[1], (1500, 380))
-        self.assertEqual(taps[2], (1500, 450))
-
-    def test_apply_filter_already_active_filters(self):
-        """Si los filtros ya están encendidos (no detecta _off), solo abre y cierra el menú."""
-        self.mock_vision.find_template.return_value = (1800, 100)
-        self.mock_vision.wait_for_template.return_value = None
-
-        self.upgrader._apply_filter("gold")
-
-        self.assertEqual(self.mock_device.tap.call_count, 2)
-        taps = [call[0] for call in self.mock_device.tap.call_args_list]
-        self.assertEqual(taps[0], (1800, 100))
-        self.assertEqual(taps[1], (1800, 100))
+    def test_reset_filter_cache(self):
+        """Verifica que reset_filter_cache borre la caché de sesión."""
+        self.upgrader._session_filters = {"gold": True, "elixir": False, "perm": True}
+        self.upgrader.reset_filter_cache()
+        self.assertIsNone(self.upgrader._session_filters)
 
 
 class TestWallUpgraderTemplateAndMatching(unittest.TestCase):
@@ -475,11 +521,8 @@ class TestWallUpgraderTemplateAndMatching(unittest.TestCase):
         mock_device.screenshot.return_value = np.zeros((1080, 1920, 3), dtype=np.uint8)
         mock_vision = MagicMock()
 
-        calls = {"count": 0}
-
-        def mock_find(screen, tpl, threshold=0.74, zona=None):
-            calls["count"] += 1
-            if calls["count"] >= 3:
+        def mock_find(screen, tpl, threshold=None, zona=None):
+            if mock_device.swipe.call_count >= 1:
                 return (1600, 500)
             return None
 
@@ -489,6 +532,47 @@ class TestWallUpgraderTemplateAndMatching(unittest.TestCase):
         found = upgrader._find_and_tap_wall_in_list()
         self.assertTrue(found)
         self.assertTrue(mock_device.swipe.called, "Debe haber deslizado la lista")
+
+    def test_find_and_tap_wall_rejects_false_positive_scores_under_85(self):
+        """
+        Verifica que coincidencias con scores entre 0.75 y 0.84 (ej. Grand Warden con ~0.80)
+        sean descartadas y no generen ningún tap.
+        """
+        mock_device = MagicMock()
+        mock_device.width = 2400
+        mock_device.height = 1080
+        fixture_path = os.path.join(PROJECT_ROOT, "tests", "fixtures", "sample_filters_off.jpg")
+        mock_device.screenshot.return_value = cv2.imread(fixture_path)
+
+        from core.vision import Vision
+        upgrader = WallUpgrader(mock_device, Vision())
+        found = upgrader._find_and_tap_wall_in_list()
+        self.assertFalse(found, "Grand Warden no debe ser detectado como Wall")
+        self.assertEqual(mock_device.tap.call_count, 0, "No debe pulsar ninguna posición")
+
+    def test_find_and_tap_wall_rejects_attached_compound_words(self):
+        """
+        Verifica que si a la derecha inmediata de 'Wall' hay letras adheridas (ej. 'Wall Wrecker'),
+        la verificación estricta descarte la coincidencia.
+        """
+        mock_device = MagicMock()
+        mock_device.width = 2400
+        mock_device.height = 1080
+
+        # Crear imagen con 'Wall' y letras blancas pegadas inmediatamente a la derecha
+        screen = np.zeros((1080, 2400, 3), dtype=np.uint8)
+        lbl = cv2.imread(os.path.join(PROJECT_ROOT, "assets", "buttons", "wall_label_generic.png"))
+        th, tw = lbl.shape[:2]
+        lx, ly = 1600, 400
+        screen[ly:ly + th, lx:lx + tw] = lbl
+        screen[ly + 8:ly + th - 8, lx + tw:lx + tw + 15] = 255
+        mock_device.screenshot.return_value = screen
+
+        from core.vision import Vision
+        upgrader = WallUpgrader(mock_device, Vision())
+        found = upgrader._find_and_tap_wall_in_list()
+        self.assertFalse(found, "Nombre compuesto con letras adheridas debe ser rechazado")
+        self.assertEqual(mock_device.tap.call_count, 0)
 
 
 class TestCostEvaluation(unittest.TestCase):

@@ -303,9 +303,13 @@ class WallUpgrader:
         if self.source_level is not None and self.target_level is None:
             self.target_level = self.source_level + 1
 
+        # 0. Caché de sesión en RAM para filtros activos
+        self._session_filters: Optional[Dict[str, bool]] = None
+
         # 1. Menú del constructor
         self.tpl_build_btn = "assets/buttons/build_btn.png"
         self.tpl_filter_btn = "assets/buttons/build_filter_btn.png"
+        self.tpl_wall_label = "assets/buttons/wall_label_generic.png"
         
         # Plantilla global reutilizable válida para cualquier transición (1->2, 5->6, 10->11, ..., N->N+1)
         self.tpl_wall_row_generic = "assets/buttons/wall_row_generic.png"
@@ -344,28 +348,89 @@ class WallUpgrader:
 
     order_resources_by_priority = compare_and_order_resources
 
+    # ROIs normalizadas relativas (ymin, ymax, xmin, xmax) calibradas sobre sample_filters_active.jpg (2400x1080)
+    FILTER_BUTTON_ROIS = {
+        "gold": (0.198, 0.265, 0.408, 0.504),
+        "elixir": (0.198, 0.265, 0.523, 0.619),
+        "perm": (0.431, 0.498, 0.635, 0.731),
+    }
+
+    # Coordenadas relativas de tap (rx, ry) al centro de cada botón de filtro
+    FILTER_BUTTON_TAPS = {
+        "gold": (0.456, 0.231),
+        "elixir": (0.571, 0.231),
+        "perm": (0.683, 0.465),
+    }
+
+    def reset_filter_cache(self) -> None:
+        """Restablece la caché de sesión de filtros en RAM."""
+        self._session_filters = None
+
+    @staticmethod
+    def _is_filter_button_active(screen: np.ndarray, roi: Tuple[float, float, float, float]) -> bool:
+        """
+        Determina si un botón de filtro está activo (amarillo/dorado) o inactivo (marrón).
+        Mide el porcentaje de píxeles amarillo/dorado brillante en HSV (15 <= H <= 38, S >= 130, V >= 185)
+        sobre los bordes/fondo del botón (evitando el centro para que la moneda dorada de Gold no dé
+        falso positivo cuando esté apagado; umbral >= 0.40).
+        """
+        if screen is None or getattr(screen, "size", 0) == 0:
+            return False
+
+        h, w = screen.shape[:2]
+        ry1, ry2, rx1, rx2 = roi
+        y1, y2 = int(ry1 * h), int(ry2 * h)
+        x1, x2 = int(rx1 * w), int(rx2 * w)
+
+        btn = screen[y1:y2, x1:x2]
+        if btn.size == 0 or btn.ndim != 3:
+            return False
+
+        hsv = cv2.cvtColor(btn, cv2.COLOR_BGR2HSV)
+        mask = (
+            (hsv[:, :, 0] >= 15)
+            & (hsv[:, :, 0] <= 38)
+            & (hsv[:, :, 1] >= 130)
+            & (hsv[:, :, 2] >= 185)
+        )
+
+        bh, bw = btn.shape[:2]
+        border_mask = np.zeros((bh, bw), dtype=bool)
+        border_mask[4:20, 10:bw - 10] = True
+        border_mask[bh - 20:bh - 4, 10:bw - 10] = True
+        border_mask[10:bh - 10, 4:20] = True
+        border_mask[10:bh - 10, bw - 20:bw - 4] = True
+
+        if not np.any(border_mask):
+            return False
+
+        pct = float(np.mean(mask[border_mask]))
+        return pct >= 0.40
+
+    def detect_filter_states(self, screen: np.ndarray) -> Dict[str, bool]:
+        """Detecta el estado activo (True/False) de los 3 botones principales de filtro."""
+        return {
+            k: self._is_filter_button_active(screen, roi)
+            for k, roi in self.FILTER_BUTTON_ROIS.items()
+        }
+
     def _apply_filter(self, resource_type: str):
         """
-        Abre el menú de filtros del constructor y aplica la combinación aditiva
-        del filtro RSS correspondiente (Oro o Elixir) y el filtro permanente.
-
-        JUSTIFICACIÓN TÉCNICA (POR QUÉ SE REQUIEREN AMBOS FILTROS):
-        -------------------------------------------------------------
-        El filtro exclusivo por RSS (Oro o Elixir) no siempre cubre el 100% de los
-        muros detectables debido a las siguientes restricciones del juego:
-        1. Categorización de estructuras: En Clash of Clans, los muros están clasificados
-           como mejoras permanentes de la aldea ('Permanent Upgrades'). Cuando solo se
-           activa el filtro RSS, el motor de recomendaciones del juego puede priorizar
-           u ocultar muros si existen edificios convencionales o trampas compitiendo por
-           el mismo recurso.
-        2. Muros bi-recurso (Nivel >= 5): Los muros de nivel 5 en adelante admiten
-           tanto Oro como Elixir según la tabla de costos oficial. Si solo se consulta
-           el filtro RSS, la lista puede omitir agrupaciones de muros o segmentaciones secundarias.
-        
-        Al unir ambos filtros (filtro RSS del recurso seleccionado + filtro permanente),
-        se asegura la cobertura del 100% de los muros pendientes de mejora disponibles,
-        sin omitir ningún grupo en la lista.
+        Abre el menú de filtros del constructor y aplica la combinación óptima (RSS + Permanente):
+        - Usa caché de sesión en RAM: si los filtros ya están en el estado objetivo, omite abrir el menú (0 clicks).
+        - Si necesita abrir el menú, detecta el estado real (ON/OFF) de cada botón vía HSV
+          y pulsa ÚNICAMENTE los que difieran del estado objetivo (apagando Gold al pasar a Elixir y viceversa).
         """
+        target_state = (
+            {"gold": True, "elixir": False, "perm": True}
+            if resource_type == "gold"
+            else {"gold": False, "elixir": True, "perm": True}
+        )
+
+        if self._session_filters == target_state:
+            log.info("ℹ️ Filtros ya configurados en sesión (%s). Omitiendo apertura de menú.", self._session_filters)
+            return
+
         screen = self.device.screenshot()
         filter_pos = self.vision.find_template(screen, self.tpl_filter_btn, threshold=0.70, zona="ESQUINA_SUP_DER")
         if not filter_pos:
@@ -377,42 +442,41 @@ class WallUpgrader:
         self.device.tap(*filter_pos)
         time.sleep(0.8)
 
-        # 1. Filtro RSS de recurso (Oro o Elixir)
-        target_res_tpl = self.tpl_filter_gold_off if resource_type == "gold" else self.tpl_filter_elixir_off
-        res_pos = self.vision.wait_for_template(
-            self.device.screenshot, target_res_tpl, timeout=2.5, threshold=0.74, zona="COMPLETA"
-        )
-        if res_pos:
-            log.info("🎯 Filtro de recurso (%s) detectado apagado en %s. Activando...", resource_type.upper(), res_pos)
-            HumanBehavior.reaction_delay()
-            self.device.tap(*res_pos)
-            time.sleep(0.6)
-        else:
-            log.info("ℹ️ Filtro de recurso (%s) ya está activado en el menú.", resource_type.upper())
+        menu_screen = self.device.screenshot()
+        current_state = self.detect_filter_states(menu_screen)
 
-        # 2. Filtro Permanente en combinación con RSS (cobertura 100% de muros)
-        perm_pos = self.vision.wait_for_template(
-            self.device.screenshot, self.tpl_filter_perm_off, timeout=1.5, threshold=0.74, zona="COMPLETA"
-        )
-        if perm_pos:
-            log.info("🎯 Filtro permanente detectado apagado en %s. Activando en combinación con RSS...", perm_pos)
-            HumanBehavior.reaction_delay()
-            self.device.tap(*perm_pos)
-            time.sleep(0.6)
-        else:
-            log.info("ℹ️ Filtro permanente ya está activado en el menú.")
+        w = getattr(self.device, "width", menu_screen.shape[1] if menu_screen is not None else 2400)
+        h = getattr(self.device, "height", menu_screen.shape[0] if menu_screen is not None else 1080)
+
+        # Pulsar ÚNICAMENTE los botones cuyo estado actual difiera de target_state
+        for key in ("gold", "elixir", "perm"):
+            if current_state.get(key) != target_state.get(key):
+                desired = target_state[key]
+                action_str = "Activando" if desired else "Desactivando"
+                log.info("🎯 Filtro %s en estado %s (objetivo: %s). %s...", key.upper(), current_state.get(key), desired, action_str)
+                rx, ry = self.FILTER_BUTTON_TAPS[key]
+                tap_x, tap_y = int(rx * w), int(ry * h)
+                HumanBehavior.reaction_delay()
+                self.device.tap(tap_x, tap_y)
+                time.sleep(0.4)
+                current_state[key] = desired
 
         # Cerrar el menú desplegable tocando de nuevo el botón de filtro
         log.info("Cerrando desplegable de filtros...")
         self.device.tap(*filter_pos)
         time.sleep(0.8)
 
+        self._session_filters = dict(current_state)
+
     def _find_and_tap_wall_in_list(self) -> bool:
         """
-        Busca la fila de 'Wall' en la lista de mejoras del constructor.
-        Usa la plantilla global reutilizable ('wall_row_generic.png') válida para
-        cualquier nivel, con fallback a 'wall_row_item.png' para total compatibilidad
-        con la transición 18 -> 19 sin regresiones.
+        Busca la fila de 'Wall' en la lista de mejoras del constructor con alta fiabilidad (>= 95%):
+        1. Prioriza 'wall_label_generic.png' con threshold >= 0.85 en escala de grises.
+        2. Verifica que el ROI contenga texto blanco binarizado (letras de 'Wall').
+        3. Verifica que a la derecha inmediata del texto 'Wall' no haya más letras blancas pegadas
+           (descarta nombres compuestos como 'Wall Wrecker' o colisiones con 'Grand Warden'/'Bomb Tower').
+        4. Si no supera el umbral estricto, fallback a 'wall_row_generic.png' / 'wall_row_item.png'
+           elevando su umbral mínimo a 0.85.
         Realiza deslizamientos fluidos hacia arriba para recorrer toda la lista.
         """
         max_attempts = 7
@@ -420,16 +484,66 @@ class WallUpgrader:
 
         for attempt in range(max_attempts):
             screen = self.device.screenshot()
+            screen_gray = self.vision.to_gray(screen)
 
-            # 1. Búsqueda con plantilla global reutilizable
-            wall_pos = self.vision.find_template(
-                screen, self.tpl_wall_row_generic, threshold=0.74, zona="MITAD_DERECHA"
-            )
+            wall_pos = None
+            rejected_compound = False
 
-            # 2. Fallback con plantilla legacy (18 -> 19) si no se encontró
-            if not wall_pos:
+            # 1. Búsqueda prioritaria con wall_label_generic.png y verificación estricta
+            cached_lbl = None
+            if hasattr(self.vision, "_load_template"):
+                try:
+                    res_load = self.vision._load_template(self.tpl_wall_label)
+                    if isinstance(res_load, tuple) and len(res_load) == 2 and isinstance(res_load[1], (tuple, list)):
+                        cached_lbl = res_load
+                except Exception:
+                    cached_lbl = None
+
+            if cached_lbl is not None:
+                lbl_gray, (th, tw) = cached_lbl
+                search_area, off_x, off_y = self.vision._crop_zone(screen_gray, "MITAD_DERECHA")
+                if search_area.shape[0] >= th and search_area.shape[1] >= tw:
+                    res = cv2.matchTemplate(search_area, lbl_gray, cv2.TM_CCOEFF_NORMED)
+                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+                    if max_val >= 0.85:
+                        mx, my = max_loc[0] + off_x, max_loc[1] + off_y
+                        match_roi = screen_gray[my : my + th, mx : mx + tw]
+                        bin_match = cv2.threshold(match_roi, 180, 255, cv2.THRESH_BINARY)[1]
+                        white_pixels = int(np.sum(bin_match > 0))
+
+                        # Verificar presencia de texto blanco ('Wall' contiene >= 250 px blancos)
+                        if white_pixels >= 250:
+                            # Verificar que a la derecha inmediata no haya letras pegadas
+                            x_right_start = mx + tw
+                            x_right_end = min(screen_gray.shape[1], mx + tw + 20)
+                            right_strip = screen_gray[my + 6 : my + th - 6, x_right_start : x_right_end]
+                            bin_right = cv2.threshold(right_strip, 180, 255, cv2.THRESH_BINARY)[1] if right_strip.size > 0 else np.zeros((1, 1), dtype=np.uint8)
+
+                            has_attached_letters = False
+                            if right_strip.size > 0:
+                                col_sums = np.sum(bin_right > 0, axis=0)
+                                if any(c >= 8 for c in col_sums[:12]) or np.sum(bin_right > 0) >= 35:
+                                    has_attached_letters = True
+
+                            if not has_attached_letters:
+                                wall_pos = (mx + tw // 2, my + th // 2)
+                            else:
+                                rejected_compound = True
+                                log.debug("Palabra compuesta o letras adheridas tras 'Wall' en (%d, %d). Descartando.", mx, my)
+            else:
+                # Si _load_template no está disponible (mocked vision), buscar con find_template
                 wall_pos = self.vision.find_template(
-                    screen, self.tpl_wall_row, threshold=0.74, zona="MITAD_DERECHA"
+                    screen, self.tpl_wall_label, threshold=0.85, zona="MITAD_DERECHA"
+                )
+
+            # 2. Fallback a wall_row_generic.png / wall_row_item.png con umbral elevado a 0.85
+            if not wall_pos and not rejected_compound:
+                wall_pos = self.vision.find_template(
+                    screen, self.tpl_wall_row_generic, threshold=0.85, zona="MITAD_DERECHA"
+                )
+            if not wall_pos and not rejected_compound:
+                wall_pos = self.vision.find_template(
+                    screen, self.tpl_wall_row, threshold=0.85, zona="MITAD_DERECHA"
                 )
 
             if wall_pos:
