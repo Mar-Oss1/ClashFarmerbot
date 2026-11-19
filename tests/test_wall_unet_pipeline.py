@@ -20,6 +20,8 @@ from unittest.mock import MagicMock, patch
 import cv2
 import numpy as np
 
+from core.config import SETTINGS
+
 # Raíz del proyecto
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -303,6 +305,26 @@ class TestWallSegDetector(unittest.TestCase):
             overlay = detector.build_overlay(frame_bgr, mask)
             self.assertEqual(overlay.shape, (1080, 2400, 3))
             self.assertEqual(overlay.dtype, np.uint8)
+
+    def test_get_wall_seg_detector_reads_conf_from_settings(self):
+        """Valida que get_wall_seg_detector() resuelva wall_seg_conf desde settings.json y permita overrides."""
+        reset_wall_seg_detector()
+        # 1. Por defecto, lee wall_seg_conf desde SETTINGS["attack"]["jump_optimizer"] (0.3)
+        expected_conf = float(SETTINGS.get("attack", {}).get("jump_optimizer", {}).get("wall_seg_conf", 0.50))
+        det = get_wall_seg_detector()
+        self.assertEqual(det.conf_thresh, expected_conf)
+
+        # 2. Con configuración modificada vía patch
+        with patch.dict(SETTINGS, {"attack": {"jump_optimizer": {"wall_seg_conf": 0.35}}}):
+            reset_wall_seg_detector()
+            det_patched = get_wall_seg_detector()
+            self.assertEqual(det_patched.conf_thresh, 0.35)
+
+        # 3. Con override explícito por parámetro
+        reset_wall_seg_detector()
+        det_override = get_wall_seg_detector(conf_thresh=0.42)
+        self.assertEqual(det_override.conf_thresh, 0.42)
+        reset_wall_seg_detector()
 
 
 class TestWallCompartmentsIntegration(unittest.TestCase):

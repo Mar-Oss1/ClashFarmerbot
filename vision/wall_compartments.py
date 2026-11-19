@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from collections import deque
+from collections import deque, defaultdict
 from dataclasses import dataclass, field
 import cv2
 import numpy as np
@@ -209,6 +209,40 @@ from vision.wall_seg_detector import (
 _CORE_MASKS_CACHE: dict[float, tuple[np.ndarray, int]] = {}
 
 
+def _count_wall_pixels_in_core(
+    pt: tuple[int, int],
+    wall_mask: np.ndarray,
+    core_radius: float = DEFAULT_CORE_RADIUS,
+) -> int:
+    """
+    Cuenta la cantidad de píxeles de muro presentes dentro del radio core_radius
+    alrededor de pt=(x, y) de forma eficiente utilizando máscaras circulares en caché.
+    """
+    if wall_mask is None or getattr(wall_mask, "size", 0) == 0 or core_radius <= 0:
+        return 0
+
+    cx, cy = int(round(pt[0])), int(round(pt[1]))
+    h, w = wall_mask.shape[:2]
+    r = int(math.ceil(core_radius))
+
+    x0 = max(0, cx - r)
+    x1 = min(w, cx + r + 1)
+    y0 = max(0, cy - r)
+    y1 = min(h, cy + r + 1)
+
+    if x1 <= x0 or y1 <= y0:
+        return 0
+
+    sub_mask = wall_mask[y0:y1, x0:x1]
+    if core_radius not in _CORE_MASKS_CACHE:
+        ys, xs = np.ogrid[-r : r + 1, -r : r + 1]
+        _CORE_MASKS_CACHE[core_radius] = ((xs ** 2 + ys ** 2) <= (core_radius ** 2), r)
+
+    full_circle, cr = _CORE_MASKS_CACHE[core_radius]
+    mask_slice = full_circle[y0 - cy + cr : y1 - cy + cr, x0 - cx + cr : x1 - cx + cr]
+    return int(np.count_nonzero(sub_mask[mask_slice] > 0))
+
+
 def is_valid_wall_centered_jump(
     pt: tuple[int, int],
     wall_mask: np.ndarray,
@@ -224,28 +258,7 @@ def is_valid_wall_centered_jump(
     if min_wall_pixels <= 0 or core_radius <= 0:
         return True
 
-    cx, cy = int(round(pt[0])), int(round(pt[1]))
-    h, w = wall_mask.shape[:2]
-    r = int(math.ceil(core_radius))
-
-    x0 = max(0, cx - r)
-    x1 = min(w, cx + r + 1)
-    y0 = max(0, cy - r)
-    y1 = min(h, cy + r + 1)
-
-    if x1 <= x0 or y1 <= y0:
-        return False
-
-    sub_mask = wall_mask[y0:y1, x0:x1]
-    if core_radius not in _CORE_MASKS_CACHE:
-        ys, xs = np.ogrid[-r : r + 1, -r : r + 1]
-        _CORE_MASKS_CACHE[core_radius] = ((xs ** 2 + ys ** 2) <= (core_radius ** 2), r)
-
-    full_circle, cr = _CORE_MASKS_CACHE[core_radius]
-    mask_slice = full_circle[y0 - cy + cr : y1 - cy + cr, x0 - cx + cr : x1 - cx + cr]
-
-    wall_pixels_count = int(np.count_nonzero(sub_mask[mask_slice] > 0))
-    return wall_pixels_count >= min_wall_pixels
+    return _count_wall_pixels_in_core(pt, wall_mask, core_radius=core_radius) >= min_wall_pixels
 
 
 def rasterize_wall_mask(
@@ -769,7 +782,7 @@ def optimize_jumps(
     wall_mask: np.ndarray | None = None,
     beam_width: int = DEFAULT_BEAM_WIDTH,
     min_sep_px: float = DEFAULT_MIN_SEP_PX,
-    min_wall_pixels: int = DEFAULT_MIN_WALL_PIXELS,
+    min_wall_pixels: int | None = None,
     core_radius: float = DEFAULT_CORE_RADIUS,
     wall_detection_mode: str | None = None,
 ) -> CompartmentAnalysisResult:
@@ -796,8 +809,17 @@ def optimize_jumps(
 
     beam_width = int(cfg_opt.get("beam_width", beam_width))
     min_sep_px = float(cfg_opt.get("min_sep_px", min_sep_px))
-    min_wall_pixels = int(cfg_opt.get("min_wall_pixels", min_wall_pixels))
     core_radius = float(cfg_opt.get("core_radius", core_radius))
+
+    # Escalamiento dinámico de min_wall_pixels si no se pasó explícitamente
+    if min_wall_pixels is not None:
+        min_wall_pixels = int(min_wall_pixels)
+    else:
+        base_min_wall = int(cfg_opt.get("min_wall_pixels", DEFAULT_MIN_WALL_PIXELS))
+        if w < 2000:
+            min_wall_pixels = max(10, int(round(base_min_wall * (w / 2400.0))))
+        else:
+            min_wall_pixels = base_min_wall
 
     # Determinar modo de detección de muros ("unet" vs "raycast")
     if wall_detection_mode is None:
@@ -1034,19 +1056,23 @@ def optimize_jumps(
     # Filtrar candidatos válidos:
     # A) Filtro de densidad de muro (is_valid_wall_centered_jump con core_radius=42, min_wall_pixels=30)
     # B) Cubre al menos 2 compartimentos libres en comp_labels/nearest_labels
-    valid_candidates: list[tuple[tuple[int, int], set[int]]] = []
+    raw_valid_candidates: list[tuple[tuple[int, int], set[int], int, int, int]] = []
     for cand in candidates:
         if (time.perf_counter() - t_start) >= loop_deadline:
             break
 
-        cand_orig = (int(round(cand[0] * scale)), int(round(cand[1] * scale)))
-        if min_wall_pixels > 0 and unscaled_wall_mask is not None:
-            if not is_valid_wall_centered_jump(
+        cand_orig_x = int(round(cand[0] * scale))
+        cand_orig_y = int(round(cand[1] * scale))
+        cand_orig = (cand_orig_x, cand_orig_y)
+
+        wall_px = 0
+        if unscaled_wall_mask is not None:
+            wall_px = _count_wall_pixels_in_core(
                 cand_orig,
                 unscaled_wall_mask,
                 core_radius=core_radius,
-                min_wall_pixels=min_wall_pixels,
-            ):
+            )
+            if min_wall_pixels > 0 and wall_px < min_wall_pixels:
                 continue
 
         touched_comps = get_compartments_in_footprint(
@@ -1056,7 +1082,36 @@ def optimize_jumps(
             nearest_labels=nearest_labels,
         )
         if len(touched_comps) >= 2:
-            valid_candidates.append((cand, touched_comps))
+            raw_valid_candidates.append((cand, touched_comps, wall_px, cand_orig_x, cand_orig_y))
+
+    # Poda por equivalencia topológica:
+    # Agrupar por comp_key = frozenset(touched_comps)
+    candidates_by_comp: dict[frozenset[int], list] = defaultdict(list)
+    for cand, touched_comps, wall_px, cx_orig, cy_orig in raw_valid_candidates:
+        comp_key = frozenset(touched_comps)
+        candidates_by_comp[comp_key].append((cand, touched_comps, wall_px, cx_orig, cy_orig))
+
+    valid_candidates: list[tuple[tuple[int, int], set[int]]] = []
+    for comp_key, c_list in candidates_by_comp.items():
+        # Prioridad 1: mayor densidad de muro en el núcleo
+        c_list.sort(key=lambda item: item[2], reverse=True)
+        best = c_list[0]
+        valid_candidates.append((best[0], best[1]))
+
+        # Conservar hasta 2 representantes solo si están separados más de min_sep_px del primero
+        if len(c_list) > 1:
+            best_x_orig, best_y_orig = best[3], best[4]
+            for second in c_list[1:]:
+                sec_x_orig, sec_y_orig = second[3], second[4]
+                if math.hypot(sec_x_orig - best_x_orig, sec_y_orig - best_y_orig) >= min_sep_px:
+                    valid_candidates.append((second[0], second[1]))
+                    break
+
+    log.debug(
+        "✂️ [BEAM] Candidatos podados por equivalencia topológica: %d -> %d",
+        len(raw_valid_candidates),
+        len(valid_candidates),
+    )
 
     # 8. Búsqueda con Anticipación (Beam Search con beam_width = 4)
     # Reemplaza la parada temprana voraz (min_marginal_gain) para habilitar encadenamiento
@@ -1082,6 +1137,8 @@ def optimize_jumps(
 
     current_beam: list[BeamState] = [root_state]
     all_evaluated_states: list[BeamState] = [root_state]
+    cost_cache: dict[tuple, tuple[float, dict[int, float]]] = {}
+    total_states_evaluated = 0
 
     for depth in range(max_jumps):
         if (time.perf_counter() - t_start) >= loop_deadline:
@@ -1114,12 +1171,20 @@ def optimize_jumps(
                     continue
 
                 test_bridges = state.active_bridges + [touched_comps]
-                cand_cost, cand_dists = compute_total_cost(
-                    graph=graph,
-                    entry_comps=entry_comps,
-                    targets=targets,
-                    jump_bridges=test_bridges,
-                )
+                bridge_key = tuple(sorted(tuple(sorted(b)) for b in test_bridges))
+
+                if bridge_key in cost_cache:
+                    cand_cost, cand_dists = cost_cache[bridge_key]
+                else:
+                    cand_cost, cand_dists = compute_total_cost(
+                        graph=graph,
+                        entry_comps=entry_comps,
+                        targets=targets,
+                        jump_bridges=test_bridges,
+                    )
+                    cost_cache[bridge_key] = (cand_cost, cand_dists)
+
+                total_states_evaluated += 1
 
                 marginal_gain = state.cost - cand_cost
                 if marginal_gain < -1e-6:
@@ -1178,6 +1243,12 @@ def optimize_jumps(
 
         current_beam = new_beam
 
+    log.debug(
+        "🧠 [BEAM] Búsqueda completada: %d estados evaluados en %.1f ms",
+        total_states_evaluated,
+        (time.perf_counter() - t_start) * 1000.0,
+    )
+
     # Selección del estado óptimo global entre todos los estados evaluados
     if force_max_jumps:
         best_state = max(
@@ -1211,6 +1282,7 @@ def optimize_jumps(
             footprint=jump_footprint,
             targets=targets,
             edges=edges,
+            grid_scale=scale,
         )
 
     return CompartmentAnalysisResult(
@@ -1241,6 +1313,7 @@ def render_debug_overlay(
     footprint: dict | tuple | float | int,
     targets: list[dict] | None = None,
     edges: list[tuple[int, int]] | None = None,
+    grid_scale: int = 1,
 ) -> np.ndarray:
     """
     Genera una imagen de auditoría visual con:
@@ -1265,7 +1338,12 @@ def render_debug_overlay(
         color_overlay = palette[comp_labels]
         cv2.addWeighted(color_overlay, 0.30, canvas, 0.70, 0, canvas)
 
-    canvas[wall_mask > 0] = [240, 240, 240]
+    if wall_mask is not None:
+        if wall_mask.shape[:2] == (h, w):
+            canvas[wall_mask > 0] = [240, 240, 240]
+        else:
+            resized_wall = cv2.resize(wall_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            canvas[resized_wall > 0] = [240, 240, 240]
 
     for t in (targets or []):
         cx, cy = t["center"]
@@ -1297,15 +1375,20 @@ def render_debug_overlay(
     else:
         rx = ry = float(footprint)
 
+    scale = max(1, int(grid_scale))
+    scaled_rx = rx / scale
+    scaled_ry = ry / scale
+
     for idx, jump in enumerate(selected_jumps, start=1):
-        jx, jy = jump.x, jump.y
+        jx = int(round(jump.x / scale))
+        jy = int(round(jump.y / scale))
         jump_color = (0, 255, 0) if idx == 1 else (0, 255, 255)
 
         if is_ellipse:
             cv2.ellipse(
                 canvas,
                 (jx, jy),
-                (int(round(rx)), int(round(ry))),
+                (int(round(scaled_rx)), int(round(scaled_ry))),
                 angle_deg,
                 0,
                 360,
@@ -1314,7 +1397,7 @@ def render_debug_overlay(
                 cv2.LINE_AA,
             )
         else:
-            cv2.circle(canvas, (jx, jy), int(round(rx)), jump_color, 2, cv2.LINE_AA)
+            cv2.circle(canvas, (jx, jy), int(round(scaled_rx)), jump_color, 2, cv2.LINE_AA)
 
         cv2.circle(canvas, (jx, jy), 5, (0, 0, 255), -1)
         label = f"Salto #{idx} (+{jump.gain:.1f})"

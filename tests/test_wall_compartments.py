@@ -21,6 +21,7 @@ from vision.wall_compartments import (
     optimize_jumps,
     render_debug_overlay,
     CompartmentAnalysisResult,
+    JumpCandidate,
     WallSegDetector,
     get_wall_seg_detector,
     reset_wall_seg_detector,
@@ -493,6 +494,84 @@ class TestWallCompartments(unittest.TestCase):
         self.assertGreaterEqual(len(res.jumps), 1)
         self.assertEqual(res.final_cost, 0.0)
         self.assertEqual(res.total_gain, res.initial_cost)
+
+    def test_render_debug_overlay_scales_jumps_properly(self):
+        """
+        Test 10: Valida que render_debug_overlay aplique grid_scale a los saltos.
+        En resoluciones HD (ej. 2400x1080) con grid_scale=2, el lienzo se reduce a 1200x540.
+        Los saltos con coordenadas nativas (ej. (1600, 800)) deben dibujarse escalados
+        en (800, 400) con su marcador rojo (0, 0, 255) dentro de los límites del canvas.
+        """
+        h_scaled, w_scaled = 540, 1200
+        comp_labels = np.zeros((h_scaled, w_scaled), dtype=np.int32)
+        base_img = np.zeros((1080, 2400, 3), dtype=np.uint8)
+        jump = JumpCandidate(
+            x=1600,
+            y=800,
+            gain=2.0,
+            cost_before=3.0,
+            cost_after=1.0,
+            bridged_compartments=[1, 2],
+        )
+
+        canvas = render_debug_overlay(
+            comp_labels=comp_labels,
+            base_img=base_img,
+            wall_mask=None,
+            selected_jumps=[jump],
+            footprint=72.0,
+            grid_scale=2,
+        )
+
+        self.assertEqual(canvas.shape, (540, 1200, 3))
+        # El marcador central rojo cv2.circle(canvas, (jx, jy), 5, (0, 0, 255), -1)
+        # debe ubicarse exactamente en (800, 400)
+        np.testing.assert_array_equal(canvas[400, 800], [0, 0, 255])
+        # Las coordenadas originales 1600 estarían fuera del ancho de 1200 si no se escalaran
+        self.assertGreater(jump.x, w_scaled)
+
+    def test_beam_search_40_segments_performance_within_300ms(self):
+        """
+        Test 11: Benchmark de rendimiento en 1080p con 40 segmentos de muro.
+        Beam Search con beam_width=4 y max_jumps=4 debe completar todos los niveles
+        respetando estrictamente el presupuesto < 300 ms (time_budget_sec=0.300).
+        """
+        # Generar 10 anillos concéntricos = 40 segmentos de muro en 2400x1080
+        segments = []
+        cx, cy = 1200, 540
+        for i in range(1, 11):
+            half_w = 60 * i
+            half_h = 35 * i
+            x1, y1 = cx - half_w, cy - half_h
+            x2, y2 = cx + half_w, cy + half_h
+            segments.append((x1, y1, x2, y1))
+            segments.append((x2, y1, x2, y2))
+            segments.append((x2, y2, x1, y2))
+            segments.append((x1, y2, x1, y1))
+
+        self.assertEqual(len(segments), 40)
+
+        targets = [
+            {"cls_name": "storage_gold", "center": (cx, cy), "bbox_xyxy": (cx - 20, cy - 20, cx + 20, cy + 20)},
+            {"cls_name": "storage_elixir", "center": (cx + 50, cy + 20), "bbox_xyxy": (cx + 30, cy, cx + 70, cy + 40)},
+            {"cls_name": "storage_dark", "center": (cx - 50, cy - 20), "bbox_xyxy": (cx - 70, cy - 40, cx - 30, cy)},
+            {"cls_name": "town_hall", "center": (cx + 20, cy - 30), "bbox_xyxy": (cx, cy - 50, cx + 40, cy - 10)},
+        ]
+        drop_points = [(100, 540)]
+
+        res = optimize_jumps(
+            img_shape=(1080, 2400),
+            wall_segments=segments,
+            detections=targets,
+            drop_points=drop_points,
+            beam_width=4,
+            max_jumps=4,
+            time_budget_sec=0.300,
+        )
+
+        self.assertLess(res.execution_time_ms, 300.0, f"Beam Search excedió el presupuesto: {res.execution_time_ms} ms")
+        self.assertEqual(len(res.jumps), 4, "Debe haber completado los 4 niveles de saltos")
+        self.assertEqual(res.final_cost, 0.0, "Los 4 saltos deben permitir acceso total a los objetivos")
 
 
 if __name__ == "__main__":

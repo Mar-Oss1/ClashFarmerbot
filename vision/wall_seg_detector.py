@@ -325,11 +325,25 @@ class WallSegDetector:
 _DEFAULT_WALL_SEG_DETECTOR: Optional[WallSegDetector] = None
 
 
-def get_wall_seg_detector(model_path: str = "models/wall_seg.onnx") -> WallSegDetector:
-    """Obtiene o inicializa el singleton predeterminado de WallSegDetector."""
+def get_wall_seg_detector(
+    model_path: str | None = None,
+    conf_thresh: float | None = None,
+) -> WallSegDetector:
+    """Obtiene o inicializa el singleton predeterminado de WallSegDetector leyendo settings.json si no se pasan parámetros."""
     global _DEFAULT_WALL_SEG_DETECTOR
-    if _DEFAULT_WALL_SEG_DETECTOR is None:
-        _DEFAULT_WALL_SEG_DETECTOR = WallSegDetector(model_path=model_path)
+    cfg = SETTINGS.get("attack", {}).get("jump_optimizer", {})
+    resolved_path = model_path or cfg.get("wall_seg_model_path", "models/wall_seg.onnx")
+    resolved_conf = conf_thresh if conf_thresh is not None else float(cfg.get("wall_seg_conf", 0.50))
+
+    if (
+        _DEFAULT_WALL_SEG_DETECTOR is None
+        or _DEFAULT_WALL_SEG_DETECTOR.model_path != resolved_path
+        or _DEFAULT_WALL_SEG_DETECTOR.conf_thresh != resolved_conf
+    ):
+        _DEFAULT_WALL_SEG_DETECTOR = WallSegDetector(
+            model_path=resolved_path,
+            conf_thresh=resolved_conf,
+        )
     return _DEFAULT_WALL_SEG_DETECTOR
 
 
