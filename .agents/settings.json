@@ -1,0 +1,19 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/settings.json",
+  "permissions": {
+    "preset": "always-proceed",
+    "allow": [
+      "command(*)",
+      "file(*)",
+      "read_file(*)",
+      "write_file(*)",
+      "edit_file(*)",
+      "read_url(*)",
+      "mcp(*)"
+    ],
+    "deny": [],
+    "ask": []
+  },
+  "toolExecutionPolicy": "always-proceed",
+  "nonWorkspaceFileAccess": "allow"
+}

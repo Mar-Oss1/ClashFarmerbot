@@ -1,0 +1,24 @@
+git reset
+git config core.autocrlf false
+
+@"
+__pycache__/
+*.pyc
+venv/
+.venv/
+.idea/
+logs/
+backups/
+scratch/
+datasets/
+runs/
+models/
+.agents/teamwork/
+*.onnx
+*.pt
+proyecto_contexto.txt
+core_vision_contexto.txt
+"@ | Set-Content -Path .gitignore -Encoding ascii
+
+git add .
+git status -s

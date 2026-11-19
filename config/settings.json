@@ -1,0 +1,264 @@
+{
+  "device": {
+    "serial": "5fba8618",
+    "app_package": "com.supercell.clashofclans"
+  },
+  "ui_cache": {
+    "enabled": true,
+    "use_micro_verify": true,
+    "learn_on_detect": true
+  },
+  "loot_criteria": {
+    "min_gold": 800000,
+    "min_elixir": 800000,
+    "min_dark_elixir": 7000,
+    "conditions_required": 2
+  },
+  "economy": {
+    "min_rss_to_spend": 21000000,
+    "enable_wall_upgrade": true,
+    "upgrade_walls": true,
+    "wall_level_source": null,
+    "wall_level_target": null,
+    "wall_batch_size": 2,
+    "storage_upgrade_trigger_threshold": 0.90,
+    "storage_capacity_fallback": {
+      "th_level": 18,
+      "gold": 24000000,
+      "elixir": 24000000,
+      "dark_elixir": 420000
+    }
+  },
+  "attack": {
+    "attack_strategy": "sneaky_farming",
+    "edrag_rush": {
+      "loot_criteria": {
+        "min_gold": 500000,
+        "min_elixir": 500000,
+        "min_dark_elixir": 6000,
+        "conditions_required": 2
+      },
+      "rage_opening_count": 2,
+      "rage_core_delay_sec": 10.0,
+      "hero_ability_delay_sec": 2.0,
+      "target_destruction_percent": 70,
+      "max_battle_duration_sec": 150,
+      "damage_stagnation_timeout_sec": 5.0,
+      "min_combat_duration_before_stagnation_sec": 12.0,
+      "sweep_points_per_side": 5
+    },
+    "enable_camera_pan": true,
+    "camera_start_side": "adaptive_random",
+    "sweep_rounds": 1,
+    "use_spells": true,
+    "use_super_wall_breakers": true,
+    "swb_per_entry": 2,
+    "swb_sequence_delay_sec": 0.2,
+    "use_heroes": true,
+    "instant_hero_abilities": true,
+    "haste_per_breach": 1,
+    "use_haste_on_deep_corridor": true,
+    "deep_core_distance_px": 240,
+    "jump_memory_radius_px": 90,
+    "enable_full_cross_pan": false,
+    "deployment_mode": "structure_quota_deployment",
+    "boundary_detection_mode": "deploy_zone_finder",
+    "battle_duration_timeout_sec": 50,
+    "post_deploy_wait_sec": 10,
+    "use_yolo": true,
+    "yolo_model_path": "models/yolov8s.onnx",
+    "yolo_conf": 0.4,
+    "yolo_iou": 0.5,
+    "yolo_imgsz": 1280,
+    "yolo_min_avg_conf_for_skip_tap": 0.6,
+    "deploy_zone_ai": {
+      "enabled": true,
+      "model_path": "models/deploy_zone_finder.onnx",
+      "imgsz": 1280,
+      "conf_thresh": 0.5,
+      "use_tta": false
+    },
+    "jump_placement": "wall_raycast",
+    "wall_detection_mode": "unet",
+    "adaptive_spells_by_demand": true,
+    "allow_surrender": true,
+    "early_surrender_on_zero_loot": true,
+    "canny_low": 60,
+    "canny_high": 160,
+    "hough_threshold": 30,
+    "hough_min_len": 70,
+    "hough_max_gap": 10,
+    "wall_tol_deg": 10.0,
+    "min_crossing_angle_deg": 8.0,
+    "min_dist_from_drop_px": 20.0,
+    "min_dist_from_target_px": 30.0,
+    "wall_endpoint_tol_px": 35.0,
+    "wall_inset_px": 20,
+    "jump_spell_radius_px": 90,
+    "pair_min_dist_px": 65,
+    "pair_max_dist_px": 210,
+    "max_jumps": 4,
+    "min_jump_score": 1.0,
+    "swb_max_breaches": 4,
+    "min_separation_between_jumps_px": 110,
+    "jump_entry_wall_offset_ratio": 0.28,
+    "canonical_center_x": 1220,
+    "canonical_center_y": 500,
+    "canonical_rx_grass": 955,
+    "canonical_ry_grass": 715,
+    "jump_loot_weights": {
+      "storage_dark": 3,
+      "storage_gold": 2,
+      "storage_elixir": 2,
+      "collector_gold": 1,
+      "collector_elixir": 1,
+      "collector_dark": 1,
+      "town_hall": 0
+    },
+    "jump_optimizer": {
+      "wall_detection_mode": "unet",
+      "buildings_block": true,
+      "wall_thickness": 8,
+      "endpoint_tol": 25.0,
+      "morph_kernel_size": 5,
+      "candidate_step": 20,
+      "min_marginal_gain": 0.5,
+      "time_budget_sec": 0.3,
+      "use_wall_seg": true,
+      "wall_seg_model_path": "models/wall_seg.onnx",
+      "wall_seg_conf": 0.3,
+      "rx": 76.0,
+      "ry": 57.0,
+      "effective_radius": 72.0,
+      "min_wall_pixels": 30,
+      "core_radius": 42.0,
+      "beam_width": 4,
+      "max_jumps": 4,
+      "min_sep_px": 95.0
+    },
+    "zone_attack_flanks": [
+      "north",
+      "south",
+      "east",
+      "west"
+    ],
+    "min_unreached_targets_for_pan": 1,
+    "safe_drop_y_min": 140,
+    "safe_drop_y_max": 845
+  },
+  "humanizer": {
+    "tap_jitter_px": 10,
+    "sweep_jitter_px": 12,
+    "reaction_min_sec": 0.8,
+    "reaction_max_sec": 2.2,
+    "between_sides_min_sec": 1.2,
+    "between_sides_max_sec": 2.6,
+    "hold_deploy_min_sec": 0.28,
+    "hold_deploy_max_sec": 0.36,
+    "burst_tap_min_sec": 0.085,
+    "burst_tap_max_sec": 0.135
+  },
+  "rois": {
+    "enemy_loot": {
+      "gold": [
+        0.112,
+        0.16,
+        0.062,
+        0.17
+      ],
+      "elixir": [
+        0.165,
+        0.215,
+        0.062,
+        0.17
+      ],
+      "dark_elixir": [
+        0.22,
+        0.268,
+        0.062,
+        0.17
+      ]
+    },
+    "own_resources": {
+      "gold": [
+        0.024,
+        0.075,
+        0.825,
+        0.932
+      ],
+      "elixir": [
+        0.09,
+        0.14,
+        0.825,
+        0.932
+      ],
+      "dark_elixir": [
+        0.154,
+        0.205,
+        0.825,
+        0.932
+      ]
+    },
+    "resource_tooltips": {
+      "tap_coordinates": {
+        "gold": [0.050, 0.880],
+        "elixir": [0.115, 0.880],
+        "dark_elixir": [0.180, 0.880]
+      },
+      "outside_tap_coordinate": [0.50, 0.50]
+    }
+  },
+  "loot": {
+    "wait_after_next_min": 0.55,
+    "wait_after_next_max": 0.8,
+    "stability_frames": 2,
+    "stability_delay": 0.12,
+    "max_read_retries": 3,
+    "allow_attack_on_unstable_read": false
+  },
+  "camera": {
+    "sign_x": 1,
+    "sign_y": -1,
+    "safe_origin_x": 1200,
+    "safe_origin_y": 540,
+    "settle_wait": 0.25
+  },
+  "swipe_profiles": {
+    "camera_jump_north_to_south": {
+      "duration": 0.18,
+      "distance": 750,
+      "jitter": 0.03
+    },
+    "camera_jump_south_to_north": {
+      "duration": 0.18,
+      "distance": 750,
+      "jitter": 0.03
+    },
+    "deploy_sweep_north": {
+      "duration": 0.42,
+      "distance": 950,
+      "jitter": 0.02
+    },
+    "deploy_sweep_south": {
+      "duration": 0.42,
+      "distance": 950,
+      "jitter": 0.02
+    },
+    "recenter_camera": {
+      "duration": 0.25,
+      "distance": 400,
+      "jitter": 0.02
+    }
+  },
+  "battle_end": {
+    "use_surrender": true,
+    "wait_for_surrender_timeout": 10.0,
+    "wait_for_okay_timeout": 10.0,
+    "wait_for_return_home_timeout": 15.0,
+    "max_soft_retries": 3,
+    "restart_app_on_failure": false
+  },
+  "debug": {
+    "search_only": false
+  }
+}

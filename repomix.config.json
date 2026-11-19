@@ -1,0 +1,69 @@
+{
+  "output": {
+    "filePath": "clashfarmerbot_context.md",
+    "style": "markdown",
+    "parsableStyle": true,
+    "fileSummary": true,
+    "directoryStructure": true,
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "topFilesLength": 10,
+    "showLineNumbers": false
+  },
+  "include": [
+    "core/**/*.py",
+    "attack/**/*.py",
+    "vision/**/*.py",
+    "humanizer/**/*.py",
+    "tools/**/*.py",
+    "tests/**/*.py",
+    "config/**/*.json",
+    "main.py",
+    "requirements.txt"
+  ],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      ".venv/**",
+      "venv/**",
+      "__pycache__/**",
+      "*.pyc",
+      "*.pyo",
+      ".env*",
+      ".git/**",
+      ".idea/**",
+      ".agents/**",
+      ".gemini/**",
+      "assets/**",
+      "datasets/**",
+      "ejemplos/**",
+      "logs/**",
+      "models/**",
+      "runs/**",
+      "scratch/**",
+      "_backups/**",
+      "backup_*/**",
+      "_trash*/**",
+      "clashfarmerbot_context.md",
+      "repomix-output.*",
+      "*.md",
+      "*.png",
+      "*.jpg",
+      "*.jpeg",
+      "*.gif",
+      "*.webp",
+      "*.onnx",
+      "*.enc",
+      "*.pt",
+      "*.pth",
+      "*.rar",
+      "*.zip",
+      "*.tar",
+      "*.gz"
+    ]
+  },
+  "security": {
+    "enableSecurityCheck": true
+  }
+}
