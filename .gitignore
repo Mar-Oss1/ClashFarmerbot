@@ -1,24 +1,25 @@
-git reset
-git config core.autocrlf false
-
-@"
+# Entornos y caché Python
 __pycache__/
-*.pyc
+*.py[cod]
 venv/
 .venv/
+
+# IDE y secretos
 .idea/
+.vscode/
+.env
+
+# Logs, capturas temporales y experimentos
 logs/
-backups/
 scratch/
-datasets/
+backups/
 runs/
-models/
 .agents/teamwork/
+*_contexto.txt
+clashfarmerbot_context.md
+
+# Datasets y modelos locales pesados
+models/
+datasets/
 *.onnx
 *.pt
-proyecto_contexto.txt
-core_vision_contexto.txt
-"@ | Set-Content -Path .gitignore -Encoding ascii
-
-git add .
-git status -s

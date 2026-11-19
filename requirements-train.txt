@@ -1,0 +1,6 @@
+-r requirements-runtime.txt
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics>=8.0.0
+segmentation-models-pytorch>=0.3.0
+onnx>=1.15.0

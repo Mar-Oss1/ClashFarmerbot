@@ -1,6 +1,6 @@
 {
   "device": {
-    "serial": "5fba8618",
+    "serial": "",
     "app_package": "com.supercell.clashofclans"
   },
   "ui_cache": {
@@ -17,7 +17,6 @@
   "economy": {
     "min_rss_to_spend": 21000000,
     "enable_wall_upgrade": true,
-    "upgrade_walls": true,
     "wall_level_source": null,
     "wall_level_target": null,
     "wall_batch_size": 2,
@@ -223,46 +222,9 @@
     "allow_attack_on_unstable_read": false
   },
   "camera": {
-    "sign_x": 1,
-    "sign_y": -1,
     "safe_origin_x": 1200,
     "safe_origin_y": 540,
     "settle_wait": 0.25
-  },
-  "swipe_profiles": {
-    "camera_jump_north_to_south": {
-      "duration": 0.18,
-      "distance": 750,
-      "jitter": 0.03
-    },
-    "camera_jump_south_to_north": {
-      "duration": 0.18,
-      "distance": 750,
-      "jitter": 0.03
-    },
-    "deploy_sweep_north": {
-      "duration": 0.42,
-      "distance": 950,
-      "jitter": 0.02
-    },
-    "deploy_sweep_south": {
-      "duration": 0.42,
-      "distance": 950,
-      "jitter": 0.02
-    },
-    "recenter_camera": {
-      "duration": 0.25,
-      "distance": 400,
-      "jitter": 0.02
-    }
-  },
-  "battle_end": {
-    "use_surrender": true,
-    "wait_for_surrender_timeout": 10.0,
-    "wait_for_okay_timeout": 10.0,
-    "wait_for_return_home_timeout": 15.0,
-    "max_soft_retries": 3,
-    "restart_app_on_failure": false
   },
   "debug": {
     "search_only": false,

@@ -4,6 +4,7 @@ from core.device import Device
 from core.vision import Vision
 from core.state_machine import ClashStateMachine
 from core.logger import get_logger
+from core.config import SETTINGS, validate_settings
 
 log = get_logger("main")
 
@@ -12,6 +13,11 @@ def main():
     parser = argparse.ArgumentParser(description="ClashFarmerbot Runner")
     parser.add_argument("--attacks", type=int, default=None, help="Número máximo de ataques antes de detenerse")
     args = parser.parse_args()
+
+    # Validación preventiva de configuración al arranque
+    warnings = validate_settings(SETTINGS)
+    if warnings:
+        log.warning("Validación de configuración con %d advertencia(s). Revisa settings.json.", len(warnings))
 
     device = Device()
     if not device.connect():
