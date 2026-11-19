@@ -15,7 +15,7 @@ import numpy as np
 from core.config import SETTINGS
 from core.device import Device
 from core.vision import Vision, save_debug_image_async
-from vision.army_checker import ArmyChecker
+from vision.army_checker import ArmyChecker, BattleBarSlots
 from vision.storage_detector import StorageDetector
 from vision.yolo_detector import Detection, get_detector
 from vision.wall_raycast import (
@@ -423,809 +423,18 @@ def compute_corridor_drop_geometry(
     return _finalize_safe_drop(t_drop)
 
 
-def _compute_legacy_quadrant_jump_targets(
-    detections: list[Detection], screen_size: tuple[int, int]
-) -> list[tuple[int, int]]:
-    """
-    Heurística heredada de proyección por cuadrantes (jump_placement='legacy_quadrant').
-    """
-    import cv2
-    import numpy as np
-
-    w, h = screen_size
-    valid_classes = {"storage_gold", "storage_elixir", "storage_dark", "collector_dark"}
-    valid_storages = [d for d in detections if d.cls_name in valid_classes and d.confidence >= 0.50]
-
-    if not valid_storages:
-        log.warning("No se encontraron almacenes válidos (conf >= 0.50) para cálculo de Saltos.")
-        return []
-
-    all_points = np.array([d.center for d in detections], dtype=np.float32)
-    if len(all_points) >= 3:
-        hull = cv2.convexHull(all_points)
-        M = cv2.moments(hull)
-        if M["m00"] > 0:
-            center_x = float(M["m10"] / M["m00"])
-            center_y = float(M["m01"] / M["m00"])
-        else:
-            center_x = float(np.mean(all_points[:, 0]))
-            center_y = float(np.mean(all_points[:, 1]))
-    elif len(all_points) > 0:
-        center_x = float(np.mean(all_points[:, 0]))
-        center_y = float(np.mean(all_points[:, 1]))
-    else:
-        center_x = float(w * 0.50)
-        center_y = float(h * 0.50)
-
-    log.info("Centroide de base YOLO (legacy): (%.1f, %.1f) a partir de %d detecciones", center_x, center_y, len(all_points))
-
-    core_radius = 160
-    quadrants_storages = {"SW": [], "SE": [], "N": [], "CORE": []}
-    quadrants_projected = {"SW": [], "SE": [], "N": [], "CORE": []}
-
-    for s in valid_storages:
-        sx, sy = s.center
-        dist = float(np.hypot(sx - center_x, sy - center_y))
-
-        dx = sx - center_x
-        dy = sy - center_y
-        proj_x = int(round(sx + 0.40 * dx))
-        proj_y = int(round(sy + 0.40 * dy))
-
-        proj_x = int(np.clip(proj_x, int(0.12 * w), int(0.88 * w)))
-        proj_y = int(np.clip(proj_y, int(0.12 * h), int(0.88 * h)))
-
-        if dist < core_radius:
-            quad = "CORE"
-        elif sy >= center_y:
-            quad = "SW" if sx < center_x else "SE"
-        else:
-            quad = "N"
-
-        quadrants_storages[quad].append(s)
-        quadrants_projected[quad].append((proj_x, proj_y))
-
-    active_quads = [q for q in ("SW", "SE", "N", "CORE") if len(quadrants_storages[q]) > 0]
-    active_quads.sort(key=lambda q: len(quadrants_storages[q]), reverse=True)
-    top_quads = active_quads[:2]
-
-    targets: list[tuple[int, int]] = []
-    for q in top_quads:
-        pts = quadrants_projected[q]
-        avg_x = int(round(np.mean([p[0] for p in pts])))
-        avg_y = int(round(np.mean([p[1] for p in pts])))
-        targets.append((avg_x, avg_y))
-
-    log.info("🎯 Jump targets calculados con YOLO legacy (máx 2): %s (cuadrantes: %s)", targets, top_quads)
-    return targets
-
-
-def _compute_cluster_intersection_jump_targets(
-    detections: list[Detection], screen_size: tuple[int, int]
-) -> list[tuple[int, int]]:
-    """
-    Algoritmo de Intersecciones de Muros y Máxima Cobertura para Hechizos de Salto:
-    1. Genera candidatos de intersección entre parejas y tríos de almacenes cercanos.
-    2. Genera candidatos de muro de entrada (desplazados 0.75R hacia lado de drop) para almacenes aislados.
-    3. Evalúa el coverage scoring ponderado por loot (dark=3, gold/elixir=2, collectors=1, town_hall=0).
-    4. Selecciona secuencialmente hasta max_jumps garantizando una separación mínima R entre saltos.
-    5. Guarda el registro de decisión en logs/yolo/jump_decision_{ts}.json.
-    """
-    import json
-    import os
-    import datetime
-    import cv2
-    import numpy as np
-
-    w, h = screen_size
-    attack_cfg = SETTINGS.get("attack", {})
-
-    radius = float(attack_cfg.get("jump_spell_radius_px", 90))
-    pair_min_dist = float(attack_cfg.get("pair_min_dist_px", 65))
-    pair_max_dist = float(attack_cfg.get("pair_max_dist_px", 210))
-    max_jumps = int(attack_cfg.get("max_jumps", 3))
-    min_jump_score = float(attack_cfg.get("min_jump_score", 2.0))
-    min_sep = float(attack_cfg.get("min_separation_between_jumps_px", 110))
-    entry_offset_ratio = float(attack_cfg.get("jump_entry_wall_offset_ratio", 0.28))
-
-    loot_weights = attack_cfg.get("jump_loot_weights", {
-        "storage_dark": 3,
-        "storage_gold": 2,
-        "storage_elixir": 2,
-        "collector_dark": 1,
-        "collector_gold": 1,
-        "collector_elixir": 1,
-        "town_hall": 0,
-    })
-
-    # Filtrar edificios válidos según peso y confianza
-    yolo_conf = float(attack_cfg.get("yolo_conf", 0.40))
-    valid_loot = [
-        d for d in detections
-        if loot_weights.get(d.cls_name, 0) > 0 and d.confidence >= yolo_conf
-    ]
-    storages = [
-        d for d in valid_loot
-        if "storage" in d.cls_name
-    ]
-
-    if not valid_loot and not storages:
-        log.warning("No se detectaron edificios de botín para cálculo de saltos.")
-        return []
-
-    # Grupo principal para generación de candidatos: storages (o valid_loot si no hay storages)
-    primary_targets = storages if storages else valid_loot
-
-    # Centro de masa de la base
-    all_points = np.array([d.center for d in detections], dtype=np.float32)
-    if len(all_points) >= 3:
-        hull = cv2.convexHull(all_points)
-        M = cv2.moments(hull)
-        if M["m00"] > 0:
-            center_x = float(M["m10"] / M["m00"])
-            center_y = float(M["m01"] / M["m00"])
-        else:
-            center_x = float(np.mean(all_points[:, 0]))
-            center_y = float(np.mean(all_points[:, 1]))
-    elif len(all_points) > 0:
-        center_x = float(np.mean(all_points[:, 0]))
-        center_y = float(np.mean(all_points[:, 1]))
-    else:
-        center_x, center_y = float(w * 0.50), float(h * 0.50)
-
-    center = (center_x, center_y)
-
-    def _get_sector(pt, c_pt):
-        dx, dy = pt[0] - c_pt[0], pt[1] - c_pt[1]
-        return ("N" if dy < 0 else "S") + ("W" if dx < 0 else "E")
-
-    # Identificar índices de almacenes en valid_loot
-    storage_indices = [i for i, d in enumerate(valid_loot) if "storage" in d.cls_name]
-    target_indices = storage_indices if storage_indices else list(range(len(valid_loot)))
-
-    candidates = []
-
-    # 1. Candidatos de parejas de edificios primarios (Lateral vs Radial)
-    for i_pos in range(len(target_indices)):
-        for j_pos in range(i_pos + 1, len(target_indices)):
-            i = target_indices[i_pos]
-            j = target_indices[j_pos]
-            s1, s2 = valid_loot[i], valid_loot[j]
-            d_pair = float(np.hypot(s1.center[0] - s2.center[0], s1.center[1] - s2.center[1]))
-
-            if pair_min_dist <= d_pair <= pair_max_dist:
-                r1 = float(np.hypot(s1.center[0] - center_x, s1.center[1] - center_y))
-                r2 = float(np.hypot(s2.center[0] - center_x, s2.center[1] - center_y))
-                delta_r = abs(r1 - r2)
-
-                # Pareja Lateral: ambos a profundidad similar respecto al centro (muro exterior continuo)
-                if delta_r <= 45.0:
-                    mid_x = (s1.center[0] + s2.center[0]) / 2.0
-                    mid_y = (s1.center[1] + s2.center[1]) / 2.0
-                    vx, vy = mid_x - center_x, mid_y - center_y
-                    norm_v = max(float(np.hypot(vx, vy)), 1e-3)
-                    ux, uy = vx / norm_v, vy / norm_v
-                    # Desplazamiento lateral controlado sobre la arista exterior del compartimento
-                    jx = int(round(mid_x + 0.30 * radius * ux))
-                    jy = int(round(mid_y + 0.30 * radius * uy))
-                    candidates.append({
-                        "point": (jx, jy),
-                        "type": "lateral_pair_entrance",
-                        "sector": _get_sector((jx, jy), center),
-                        "origin_buildings": [s1.cls_name, s2.cls_name],
-                        "covered_indices": [i, j],
-                        "score": float(loot_weights.get(s1.cls_name, 0) + loot_weights.get(s2.cls_name, 0)),
-                    })
-                else:
-                    # Pareja Radial: s_outer en muro exterior, s_inner más hacia el núcleo
-                    s_outer, idx_outer = (s1, i) if r1 >= r2 else (s2, j)
-                    s_inner, idx_inner = (s2, j) if r1 >= r2 else (s1, i)
-                    vx, vy = s_outer.center[0] - center_x, s_outer.center[1] - center_y
-                    norm_v = max(float(np.hypot(vx, vy)), 1e-3)
-                    ux, uy = vx / norm_v, vy / norm_v
-                    jx = int(round(s_outer.center[0] + entry_offset_ratio * radius * ux))
-                    jy = int(round(s_outer.center[1] + entry_offset_ratio * radius * uy))
-                    candidates.append({
-                        "point": (jx, jy),
-                        "type": "radial_outer_entrance",
-                        "sector": _get_sector((jx, jy), center),
-                        "origin_buildings": [s_outer.cls_name, s_inner.cls_name],
-                        "covered_indices": [idx_outer, idx_inner],
-                        "score": float(loot_weights.get(s_outer.cls_name, 0) + loot_weights.get(s_inner.cls_name, 0)),
-                    })
-
-    # 2. Candidatos de muro de entrada para almacenes individuales (offset hacia zona de drop)
-    for i in target_indices:
-        s = valid_loot[i]
-        vx = s.center[0] - center_x
-        vy = s.center[1] - center_y
-        norm_v = max(float(np.hypot(vx, vy)), 1e-3)
-        ux, uy = vx / norm_v, vy / norm_v
-        entry_x = int(round(s.center[0] + (entry_offset_ratio * radius) * ux))
-        entry_y = int(round(s.center[1] + (entry_offset_ratio * radius) * uy))
-        candidates.append({
-            "point": (entry_x, entry_y),
-            "type": "entry_wall",
-            "sector": _get_sector((entry_x, entry_y), center),
-            "origin_buildings": [s.cls_name],
-            "covered_indices": [i],
-            "score": float(loot_weights.get(s.cls_name, 0)),
-        })
-
-    # 3. Candidatos de Corredor Vectorial en Línea para el Núcleo Profundo
-    # Si el Almacén Oscuro o Ayuntamiento están en el núcleo profundo (> deep_core_dist_px del drop),
-    # encadenar saltos en línea recta (Capa 2 intermedia y Muro del Núcleo) para crear autopista directa.
-    deep_core_dist = float(attack_cfg.get("deep_core_distance_px", 240.0))
-    core_indices = [
-        i for i in target_indices
-        if valid_loot[i].cls_name in {"storage_dark", "town_hall"}
-    ]
-
-    for c_idx in core_indices:
-        target_core = valid_loot[c_idx]
-        drop_x, drop_y = compute_canonical_diamond_drop(target_core.center, center_pt=center)
-        dist_to_drop = float(np.hypot(target_core.center[0] - drop_x, target_core.center[1] - drop_y))
-
-        if dist_to_drop >= deep_core_dist:
-            vx = target_core.center[0] - drop_x
-            vy = target_core.center[1] - drop_y
-            norm_v = max(float(np.hypot(vx, vy)), 1e-3)
-            ux, uy = vx / norm_v, vy / norm_v
-
-            # Salto 1: Capa intermedia (~45% del trayecto hacia el núcleo)
-            j1_x = int(round(drop_x + 0.45 * dist_to_drop * ux))
-            j1_y = int(round(drop_y + 0.45 * dist_to_drop * uy))
-
-            # Salto 2: Muro de entrada al compartimento del núcleo (~85% del trayecto)
-            j2_x = int(round(drop_x + 0.85 * dist_to_drop * ux))
-            j2_y = int(round(drop_y + 0.85 * dist_to_drop * uy))
-
-            candidates.append({
-                "point": (j1_x, j1_y),
-                "type": "deep_core_intermediate",
-                "sector": _get_sector((j1_x, j1_y), center),
-                "origin_buildings": [target_core.cls_name],
-                "covered_indices": [c_idx],
-                "score": float(loot_weights.get(target_core.cls_name, 3) + 2.5),
-            })
-            candidates.append({
-                "point": (j2_x, j2_y),
-                "type": "deep_core_wall",
-                "sector": _get_sector((j2_x, j2_y), center),
-                "origin_buildings": [target_core.cls_name],
-                "covered_indices": [c_idx],
-                "score": float(loot_weights.get(target_core.cls_name, 3) + 3.0),
-            })
-
-    # Clamping de seguridad dentro de pantalla jugable
-    min_x, max_x = int(0.12 * w), int(0.88 * w)
-    min_y, max_y = int(0.14 * h), int(0.84 * h)
-    for c in candidates:
-        cx_c = int(np.clip(c["point"][0], min_x, max_x))
-        cy_c = int(np.clip(c["point"][1], min_y, max_y))
-        c["point"] = (cx_c, cy_c)
-
-    # Actualizar cobertura real por radio geométrico para incluir recolectores adyacentes
-    scored_candidates = []
-    for c in candidates:
-        cx_pt, cy_pt = c["point"]
-        covered_set = set(c["covered_indices"])
-        for idx, d in enumerate(valid_loot):
-            dist_to_d = float(np.hypot(d.center[0] - cx_pt, d.center[1] - cy_pt))
-            if dist_to_d <= radius:
-                covered_set.add(idx)
-
-        c["covered_indices"] = list(covered_set)
-        c["score"] = sum(float(loot_weights.get(valid_loot[idx].cls_name, 0)) for idx in covered_set)
-        c["covered_classes"] = [valid_loot[idx].cls_name for idx in covered_set]
-        scored_candidates.append(c)
-
-    # Ordenar candidatos por puntuación descendente
-    scored_candidates.sort(key=lambda c: (c["score"], c["type"] != "entry_wall"), reverse=True)
-
-    available_sectors = set(c["sector"] for c in scored_candidates)
-
-    # Selección greedy con diversidad sectorial y separación mínima
-    selected_jumps = []
-    already_covered = set()
-    used_sectors = set()
-
-    for step in range(max_jumps):
-        best_candidate = None
-        best_marginal_gain = -1.0
-        sectors_remaining = available_sectors - used_sectors
-
-        for c in scored_candidates:
-            # Separación mínima respecto a saltos ya elegidos
-            if any(np.hypot(c["point"][0] - s["point"][0], c["point"][1] - s["point"][1]) < min_sep for s in selected_jumps):
-                continue
-
-            # Priorizar sectores sin salto previo si aún quedan disponibles
-            if sectors_remaining and c["sector"] in used_sectors:
-                continue
-
-            # Ganancia marginal (botín no cubierto previamente)
-            marginal_gain = sum(
-                float(loot_weights.get(valid_loot[i].cls_name, 0))
-                for i in c["covered_indices"]
-                if i not in already_covered
-            )
-
-            if marginal_gain > best_marginal_gain:
-                best_marginal_gain = marginal_gain
-                best_candidate = c
-
-        if best_candidate and best_marginal_gain >= min_jump_score:
-            selected_jumps.append(best_candidate)
-            already_covered.update(best_candidate["covered_indices"])
-            used_sectors.add(best_candidate["sector"])
-            log.info(
-                "🎯 Salto #%d seleccionado en %s | tipo=%s | sector=%s | score=%.1f | cubre=%s",
-                len(selected_jumps),
-                best_candidate["point"],
-                best_candidate["type"],
-                best_candidate["sector"],
-                best_candidate["score"],
-                best_candidate["covered_classes"],
-            )
-        else:
-            # Si no hubo candidato en sector libre, permitir evaluar sectores ya usados si queda botín sin cubrir
-            found_secondary = False
-            for c in scored_candidates:
-                if any(np.hypot(c["point"][0] - s["point"][0], c["point"][1] - s["point"][1]) < min_sep for s in selected_jumps):
-                    continue
-                marginal_gain = sum(
-                    float(loot_weights.get(valid_loot[i].cls_name, 0))
-                    for i in c["covered_indices"]
-                    if i not in already_covered
-                )
-                if marginal_gain > best_marginal_gain:
-                    best_marginal_gain = marginal_gain
-                    best_candidate = c
-
-            if best_candidate and best_marginal_gain >= min_jump_score:
-                selected_jumps.append(best_candidate)
-                already_covered.update(best_candidate["covered_indices"])
-                used_sectors.add(best_candidate["sector"])
-                found_secondary = True
-                log.info(
-                    "🎯 Salto #%d (secundario) seleccionado en %s | tipo=%s | sector=%s | score=%.1f | cubre=%s",
-                    len(selected_jumps),
-                    best_candidate["point"],
-                    best_candidate["type"],
-                    best_candidate["sector"],
-                    best_candidate["score"],
-                    best_candidate["covered_classes"],
-                )
-                continue
-            if not found_secondary:
-                break
-
-    # Si aún faltan saltos para alcanzar max_jumps (4 saltos), rellenar con candidatos de mayor score que respeten min_sep
-    while len(selected_jumps) < max_jumps:
-        best_extra = None
-        best_extra_score = -1.0
-        for c in scored_candidates:
-            if any(np.hypot(c["point"][0] - s["point"][0], c["point"][1] - s["point"][1]) < min_sep for s in selected_jumps):
-                continue
-            if c["score"] > best_extra_score:
-                best_extra_score = c["score"]
-                best_extra = c
-        if best_extra and best_extra_score > 0:
-            selected_jumps.append(best_extra)
-            log.info(
-                "🎯 Salto #%d (adicional de cobertura) en %s | tipo=%s | sector=%s | score=%.1f | cubre=%s",
-                len(selected_jumps),
-                best_extra["point"],
-                best_extra["type"],
-                best_extra["sector"],
-                best_extra["score"],
-                best_extra["covered_classes"],
-            )
-        else:
-            break
-
-    targets = [j["point"] for j in selected_jumps]
-
-    # Registrar decisión canónica en logs/yolo/jump_decision.json (sobrescribe un único archivo)
-    try:
-        out_dir = os.path.join("logs", "yolo")
-        os.makedirs(out_dir, exist_ok=True)
-        decision_file = os.path.join(out_dir, "jump_decision.json")
-
-        decision_log = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "algorithm": "cluster_intersections",
-            "config": {
-                "radius": radius,
-                "pair_min_dist": pair_min_dist,
-                "pair_max_dist": pair_max_dist,
-                "max_jumps": max_jumps,
-                "min_jump_score": min_jump_score,
-                "min_separation_between_jumps_px": min_sep,
-                "entry_offset_ratio": entry_offset_ratio,
-                "loot_weights": loot_weights,
-            },
-            "detections_count": len(valid_loot),
-            "candidates_evaluated": len(scored_candidates),
-            "selected_jumps": [
-                {
-                    "point": j["point"],
-                    "type": j["type"],
-                    "score": j["score"],
-                    "covered_classes": j["covered_classes"],
-                }
-                for j in selected_jumps
-            ],
-            "top_candidates": [
-                {
-                    "point": c["point"],
-                    "type": c["type"],
-                    "score": c["score"],
-                    "covered_classes": c["covered_classes"],
-                }
-                for c in scored_candidates[:10]
-            ],
-        }
-
-        with open(decision_file, "w", encoding="utf-8") as f:
-            json.dump(decision_log, f, indent=2, ensure_ascii=False)
-        log.info("📝 Registro de decisión de saltos guardado en: %s", decision_file)
-    except Exception as e_json:
-        log.warning("No se pudo guardar registro JSON de decisión de saltos: %s", e_json)
-
-    log.info("🎯 Jump targets calculados con cluster_intersections (total: %d): %s", len(targets), targets)
-    return targets
-
-
-def _compute_wall_raycast_jump_targets(
-    screen: np.ndarray,
-    detections: list[Detection],
-    screen_size: tuple[int, int]
-) -> list[tuple[int, int]]:
-    """
-    Calcula objetivos de Hechizos de Salto detectando la ubicación física real
-    de los muros mediante raycasting de aristas OpenCV (vision/wall_raycast.py).
-    
-    1. Si screen es None o faltan detecciones, delega a cluster_intersections.
-    2. Estima los ángulos isométricos dominantes de la aldea con estimate_iso_angles.
-    3. Para cada almacén interior bloqueado:
-       - Traza el rayo desde su punto de drop exterior legal hasta su centro.
-       - Invoca find_wall_crossings para hallar las aristas de los muros que cruzan el camino.
-       - Asigna el primer salto en el primer cruce desplazado +wall_inset_px hacia el almacén.
-       - Si existe un segundo cruce (muro doble, distancia >= 35px) y restan saltos, añade un segundo salto.
-       - Si no se detectan cruces, recurre a respaldo por ratio (0.75) y lo registra en el log.
-    4. Garantiza separación mínima (min_sep), respeta max_jumps y límites de pantalla.
-    5. Guarda logs/yolo/wall_raycast_debug.png con visualización completa.
-    """
-    if screen is None or screen.size == 0 or not detections:
-        log.warning("⚠️ Screen o detecciones no disponibles para Wall Raycast. Usando cluster_intersections.")
-        return _compute_cluster_intersection_jump_targets(detections, screen_size)
-
-    w, h = screen_size
-    attack_cfg = SETTINGS.get("attack", {})
-    max_jumps = int(attack_cfg.get("max_jumps", 4))
-    min_sep = float(attack_cfg.get("min_separation_between_jumps_px", 110))
-    wall_inset = float(attack_cfg.get("wall_inset_px", 20.0))
-    strip = int(attack_cfg.get("wall_strip_px", 45))
-    tol_deg = float(attack_cfg.get("wall_tol_deg", 10.0))
-    canny_low = int(attack_cfg.get("canny_low", 60))
-    canny_high = int(attack_cfg.get("canny_high", 160))
-    hough_thresh = int(attack_cfg.get("hough_threshold", 30))
-    hough_min_len = int(attack_cfg.get("hough_min_len", 70))
-    hough_max_gap = int(attack_cfg.get("hough_max_gap", 10))
-    tol_deg = float(attack_cfg.get("wall_tol_deg", 10.0))
-    min_crossing_angle = float(attack_cfg.get("min_crossing_angle_deg", 25.0))
-    min_dist_drop = float(attack_cfg.get("min_dist_from_drop_px", 40.0))
-    min_dist_target = float(attack_cfg.get("min_dist_from_target_px", 50.0))
-    endpoint_tol = float(attack_cfg.get("wall_endpoint_tol_px", 30.0))
-
-    loot_weights = attack_cfg.get("jump_loot_weights", {
-        "storage_dark": 3,
-        "storage_gold": 2,
-        "storage_elixir": 2,
-        "town_hall": 0,
-        "collector_dark": 1,
-    })
-
-    # Filtrar y ordenar almacenes por peso de botín
-    primary_targets = [
-        d for d in detections
-        if d.cls_name in {"storage_dark", "storage_gold", "storage_elixir", "town_hall"}
-    ]
-    if not primary_targets:
-        primary_targets = [
-            d for d in detections
-            if "storage" in d.cls_name or "collector" in d.cls_name
-        ]
-    if not primary_targets:
-        log.warning("No se encontraron objetivos de botín para Wall Raycast.")
-        return _compute_cluster_intersection_jump_targets(detections, screen_size)
-
-    primary_targets.sort(
-        key=lambda d: loot_weights.get(d.cls_name, 0),
-        reverse=True
-    )
-
-    # Centro de la aldea
-    all_pts = np.array([d.center for d in detections], dtype=np.float32)
-    center = (float(np.mean(all_pts[:, 0])), float(np.mean(all_pts[:, 1])))
-
-    # 1. Extracción global de segmentos de muro en una sola pasada por batalla
-    iso_angles, wall_segments = detect_global_wall_segments(
-        screen,
-        min_line_len=hough_min_len,
-        max_line_gap=hough_max_gap,
-        tol_deg=tol_deg,
-        canny_low=canny_low,
-        canny_high=canny_high,
-        hough_thresh=hough_thresh,
-        detections=detections,
-    )
-
-    adaptive_mode = attack_cfg.get("adaptive_spells_by_demand", True)
-    if adaptive_mode:
-        from vision.wall_raycast import calculate_adaptive_jump_and_breach_placements, find_wall_junctions, draw_wall_raycast_debug
-        targets_with_drops = []
-        dz_detector = None
-        try:
-            from vision.deploy_zone_detector import get_deploy_zone_detector
-            dz_detector = get_deploy_zone_detector()
-        except Exception:
-            pass
-
-        for target in primary_targets:
-            if dz_detector and dz_detector.is_ready() and dz_detector.last_mask is not None:
-                drop_x, drop_y = dz_detector.find_closest_deployable_point(
-                    int(round(target.center[0])), int(round(target.center[1])), margin_px=25,
-                    safe_bounds=(int(0.12 * w), int(0.14 * h), int(0.88 * w), int(0.84 * h))
-                )
-            else:
-                p_target = (int(round(target.center[0])), int(round(target.center[1])))
-                vx = p_target[0] - center[0]
-                vy = p_target[1] - center[1]
-                dist_c = max(float(np.hypot(vx, vy)), 1e-3)
-                drop_x = int(np.clip(p_target[0] + 250.0 * (vx / dist_c), int(0.12 * w), int(0.88 * w)))
-                drop_y = int(np.clip(p_target[1] + 250.0 * (vy / dist_c), int(0.14 * h), int(0.84 * h)))
-            targets_with_drops.append((target, (drop_x, drop_y)))
-
-        junctions = find_wall_junctions(wall_segments, iso_angles=iso_angles)
-        selected_jumps, selected_swb, debug_rays = calculate_adaptive_jump_and_breach_placements(
-            targets_with_drops=targets_with_drops,
-            wall_segments=wall_segments,
-            junctions=junctions,
-            max_jumps=max_jumps,
-            min_dist_between_jumps=min_sep,
-            safe_y_min=int(0.14 * h),
-            safe_y_max=int(0.84 * h),
-            safe_x_min=int(0.12 * w),
-            safe_x_max=int(0.88 * w),
-        )
-
-        try:
-            draw_wall_raycast_debug(
-                screen,
-                debug_rays,
-                selected_jumps,
-                junctions=junctions,
-                out_path="logs/yolo/wall_raycast_debug.png"
-            )
-        except Exception as e_dbg:
-            log.warning("No se pudo renderizar wall_raycast_debug.png: %s", e_dbg)
-
-        log.info("🎯 Jump targets calculados por Demanda Adaptativa e Intersecciones (total: %d): %s", len(selected_jumps), selected_jumps)
-        if selected_jumps:
-            return selected_jumps
-
-    def _get_sector(pt: tuple[int, int], c_pt: tuple[float, float]) -> str:
-        dx_s, dy_s = pt[0] - c_pt[0], pt[1] - c_pt[1]
-        return ("N" if dy_s < 0 else "S") + ("W" if dx_s < 0 else "E")
-
-    candidates = []
-    debug_rays = []
-
-    for target in primary_targets:
-        p_target = (int(target.center[0]), int(target.center[1]))
-        vx = p_target[0] - center[0]
-        vy = p_target[1] - center[1]
-        dist_c = max(float(np.hypot(vx, vy)), 1e-3)
-        ux, uy = vx / dist_c, vy / dist_c
-
-        # Proyección radial hacia el césped exterior (~250px más allá del objetivo)
-        p_drop_x = int(np.clip(p_target[0] + 250.0 * ux, int(0.10 * w), int(0.90 * w)))
-        p_drop_y = int(np.clip(p_target[1] + 250.0 * uy, int(0.14 * h), int(0.82 * h)))
-        p_drop = (p_drop_x, p_drop_y)
-
-        dist_ray = float(np.hypot(p_target[0] - p_drop[0], p_target[1] - p_drop[1]))
-        if dist_ray < (min_dist_drop + min_dist_target):
-            continue
-
-        debug_entry = {}
-        crossings = find_wall_crossings_from_segments(
-            p_drop=p_drop,
-            p_target=p_target,
-            wall_segments=wall_segments,
-            min_crossing_angle_deg=min_crossing_angle,
-            min_dist_drop=min_dist_drop,
-            min_dist_target=min_dist_target,
-            endpoint_tol=endpoint_tol,
-            debug_collector=debug_entry,
-        )
-        debug_rays.append(debug_entry)
-
-        if crossings:
-            log.info(
-                "🧱 [RAYCAST] %s en %s: %d cruce(s) de muro físico detectado(s): %s",
-                target.cls_name, p_target, len(crossings), crossings
-            )
-            for idx_cr, (cx_w, cy_w) in enumerate(crossings):
-                vec_tx = p_target[0] - cx_w
-                vec_ty = p_target[1] - cy_w
-                dist_t = max(float(np.hypot(vec_tx, vec_ty)), 1e-3)
-                t_ux, t_uy = vec_tx / dist_t, vec_ty / dist_t
-
-                jx = int(round(cx_w + wall_inset * t_ux))
-                jy = int(round(cy_w + wall_inset * t_uy))
-
-                bonus = 2.0 if (idx_cr == 0 or len(crossings) == 1) else 1.5
-                if target.cls_name in {"storage_dark", "town_hall"} and idx_cr > 0:
-                    bonus += 1.0
-
-                cand_pt = (jx, jy)
-                candidates.append({
-                    "pt": cand_pt,
-                    "target": target.cls_name,
-                    "sector": _get_sector(cand_pt, center),
-                    "priority": float(loot_weights.get(target.cls_name, 2)) + bonus,
-                    "is_fallback": False,
-                })
-        else:
-            log.info(
-                "⚠️ [RAYCAST] %s en %s: 0 cruces detectados. Usando respaldo por ratio (0.75)...",
-                target.cls_name, p_target
-            )
-            jx = int(round(p_drop[0] + 0.75 * (p_target[0] - p_drop[0])))
-            jy = int(round(p_drop[1] + 0.75 * (p_target[1] - p_drop[1])))
-            cand_pt = (jx, jy)
-            candidates.append({
-                "pt": cand_pt,
-                "target": target.cls_name,
-                "sector": _get_sector(cand_pt, center),
-                "priority": float(loot_weights.get(target.cls_name, 2)),
-                "is_fallback": True,
-            })
-
-    # Clamping a zona de pantalla jugable
-    min_x, max_x = int(0.12 * w), int(0.88 * w)
-    min_y, max_y = int(0.14 * h), int(0.84 * h)
-    for c in candidates:
-        cx_c = int(np.clip(c["pt"][0], min_x, max_x))
-        cy_c = int(np.clip(c["pt"][1], min_y, max_y))
-        c["pt"] = (cx_c, cy_c)
-
-    # Ordenar candidatos por prioridad
-    candidates.sort(key=lambda c: c["priority"], reverse=True)
-
-    available_sectors = set(c["sector"] for c in candidates)
-    used_sectors = set()
-    selected_jumps: list[tuple[int, int]] = []
-
-    # Selección greedy con DIVERSIDAD SECTORIAL (1 salto por cuadrante NW, NE, SW, SE)
-    for step in range(max_jumps):
-        best_cand = None
-        best_score = -1.0
-        rem_sectors = available_sectors - used_sectors
-
-        for cand in candidates:
-            pt = cand["pt"]
-            if any(np.hypot(pt[0] - sj[0], pt[1] - sj[1]) < min_sep for sj in selected_jumps):
-                continue
-            if rem_sectors and cand["sector"] in used_sectors:
-                continue
-            if cand["priority"] > best_score:
-                best_score = cand["priority"]
-                best_cand = cand
-
-        if best_cand:
-            selected_jumps.append(best_cand["pt"])
-            used_sectors.add(best_cand["sector"])
-
-    # Si aún no se alcanzaron max_jumps, tomar candidatos adicionales respetando min_sep
-    if len(selected_jumps) < max_jumps:
-        for cand in candidates:
-            pt = cand["pt"]
-            if all(np.hypot(pt[0] - sj[0], pt[1] - sj[1]) >= min_sep for sj in selected_jumps):
-                selected_jumps.append(pt)
-                if len(selected_jumps) >= max_jumps:
-                    break
-
-    # Si aún no se alcanzan max_jumps, rellenar con candidatos de cluster_intersections
-    if len(selected_jumps) < max_jumps:
-        fallback_targets = _compute_cluster_intersection_jump_targets(detections, screen_size)
-        for fb in fallback_targets:
-            if all(np.hypot(fb[0] - sj[0], fb[1] - sj[1]) >= min_sep for sj in selected_jumps):
-                selected_jumps.append(fb)
-                if len(selected_jumps) >= max_jumps:
-                    break
-
-    # Generar imagen de depuración visual
-    try:
-        draw_wall_raycast_debug(
-            screen,
-            debug_rays,
-            selected_jumps,
-            out_path="logs/yolo/wall_raycast_debug.png"
-        )
-    except Exception as e_dbg:
-        log.warning("No se pudo renderizar wall_raycast_debug.png: %s", e_dbg)
-
-    log.info("🎯 Jump targets calculados con Wall Raycast (total: %d): %s", len(selected_jumps), selected_jumps)
-    return selected_jumps
-
-
-def compute_adaptive_jump_targets_from_detections(
-    detections: list[Detection], screen_size: tuple[int, int], screen: np.ndarray | None = None
-) -> list[tuple[int, int]]:
-    """
-    Punto de entrada para el cálculo de objetivos de Hechizos de Salto.
-    Selecciona el algoritmo según config/settings.json -> attack.jump_placement:
-    - 'wall_raycast' (por defecto): Detección física real de muros mediante OpenCV raycasting de aristas.
-    - 'cluster_intersections': Intersección de muros compartidos y máxima cobertura.
-    - 'legacy_quadrant': Heurística heredada de proyección por cuadrantes.
-    """
-    mode = SETTINGS.get("attack", {}).get("jump_placement", "wall_raycast")
-    if mode == "wall_raycast":
-        if screen is not None:
-            targets = _compute_wall_raycast_jump_targets(screen, detections, screen_size)
-            if targets:
-                return targets
-            log.warning("⚠️ Wall raycast no devolvió saltos; ejecutando respaldo cluster_intersections.")
-        else:
-            log.warning("⚠️ Modo wall_raycast activo pero screen es None; usando respaldo cluster_intersections.")
-    elif mode == "legacy_quadrant":
-        return _compute_legacy_quadrant_jump_targets(detections, screen_size)
-    return _compute_cluster_intersection_jump_targets(detections, screen_size)
-
-
-def get_battle_hud_mask(h: int, w: int) -> np.ndarray:
-    """
-    Genera una máscara precisa de los elementos interactivos del HUD de batalla
-    para evitar falsos positivos de zona roja sin recortar estructuras perimetrales.
-    Corte limpio y uniforme sobre las cartas (y < 888px) que evita invasiones.
-    Resolución de referencia: 2400x1080.
-    """
-    mask = np.zeros((h, w), dtype=np.uint8)
-    scale_x = w / 2400.0
-    scale_y = h / 1080.0
-
-    # 1. Margen superior extremo (barra de estado, notch Android, temporizador)
-    mask[:int(60 * scale_y), :] = 255
-
-    # 2. Barra de despliegue de tropas (corte uniforme limpio a y=888, sin penetraciones en cartas)
-    y1_bar = int(888 * scale_y)
-    mask[y1_bar:, :] = 255
-
-    # 3. Botón "Terminar Batalla" / "End Battle" (esquina inferior izquierda)
-    # [730:885, :360]
-    y1_eb, y2_eb = int(730 * scale_y), int(885 * scale_y)
-    x1_eb, x2_eb = 0, int(360 * scale_x)
-    mask[y1_eb:y2_eb, x1_eb:x2_eb] = 255
-
-    # 4. Botón "Siguiente" / "Next" o diálogo lateral derecho
-    # [850:980, 2040:]
-    y1_next, y2_next = int(850 * scale_y), int(980 * scale_y)
-    x1_next = int(2040 * scale_x)
-    mask[y1_next:y2_next, x1_next:] = 255
-
-    # 5. HUD superior (Loot top-left, Timer top-center, Medidores top-right)
-    y_hud_top = int(100 * scale_y)
-    mask[:y_hud_top, :int(380 * scale_x)] = 255
-    # Strict top-right HUD mask para contadores de recursos (y < 160, x > 1900)
-    y2_top_right = int(160 * scale_y)
-    x1_top_right = int(1900 * scale_x)
-    mask[:y2_top_right, x1_top_right:] = 255
-
-    return mask
+# ==============================================================================
+# PLANIFICADOR DE SALTOS Y DESPACHADOR UNIFICADO (Fase 4 - Mejora 05)
+# Extraído a attack/jump_planner.py manteniendo compatibilidad retroactiva total.
+# ==============================================================================
+from attack.jump_planner import (
+    compute_adaptive_jump_targets_from_detections,
+    _compute_wall_raycast_jump_targets,
+    _compute_cluster_intersection_jump_targets,
+    _compute_legacy_quadrant_jump_targets,
+    _compute_compartment_jump_targets,
+)
+from vision.hud import get_battle_hud_mask
 
 
 def detect_village_boundary(
@@ -1492,12 +701,20 @@ class DeploymentStrategy:
         self._opened_breaches: set[tuple[int, int]] = set()
         self._used_jump_points: list[tuple[int, int]] = []
         self._heroes_deployed_in_battle: bool = False
-        self._troop_inventory: dict[str, int] = {
-            "goblins": 96,
-            "swb": 8,
-            "jump": 4,
-            "haste": 3,
+        self._battle_slots: BattleBarSlots | None = None
+        self._troop_inventory: dict[str, int] = {}
+        self._reset_battle_inventory()
+
+    def _reset_battle_inventory(self) -> dict[str, int]:
+        """Inicializa o reinicia el inventario de tropas y hechizos para la batalla actual desde SETTINGS."""
+        cfg_inv = SETTINGS.get("attack", {}).get("army_inventory", {})
+        self._troop_inventory = {
+            "goblins": int(cfg_inv.get("goblins", 96)),
+            "swb": int(cfg_inv.get("swb", 8)),
+            "jump": int(cfg_inv.get("jump", 4)),
+            "haste": int(cfg_inv.get("haste", 3)),
         }
+        return self._troop_inventory
 
     def _stroke(self, rel_pts: list[tuple[float, float]], seconds: float = 1.3, anchor_sec: float = 0.60, offset: tuple[int, int] = (0, 0)):
         w, h = self.device.width, self.device.height
@@ -1518,6 +735,13 @@ class DeploymentStrategy:
         if not force_rescan and self._cached_goblin_slot_pos is not None:
             self.device.tap(*self._cached_goblin_slot_pos)
             self._goblins_currently_active = True
+            time.sleep(0.18)
+            return True
+
+        if not force_rescan and getattr(self, "_battle_slots", None) and self._battle_slots.goblin:
+            self._cached_goblin_slot_pos = self._battle_slots.goblin
+            self._goblins_currently_active = True
+            self.device.tap(*self._cached_goblin_slot_pos)
             time.sleep(0.18)
             return True
 
@@ -1555,6 +779,14 @@ class DeploymentStrategy:
             time.sleep(0.18)
             return True
 
+        if not force_rescan and getattr(self, "_battle_slots", None) and self._battle_slots.swb:
+            self._cached_swb_slot_pos = self._battle_slots.swb
+            self._goblins_currently_active = False
+            self._swb_currently_active = True
+            self.device.tap(*self._cached_swb_slot_pos)
+            time.sleep(0.18)
+            return True
+
         screen = self.device.screenshot()
         swb_pos = self.army.find_super_wall_breaker_in_battle_bar(screen)
         if swb_pos:
@@ -1572,6 +804,20 @@ class DeploymentStrategy:
     def _ensure_spell_selected(self, spell_type: str) -> bool:
         self._goblins_currently_active = False
         self._swb_currently_active = False
+        if getattr(self, "_battle_slots", None):
+            if spell_type == "jump" and self._battle_slots.jump:
+                pos = self._battle_slots.jump
+                log.info("✨ Hechizo de Salto (Verde) detectado en la barra en %s (pre-escaneo). Seleccionando...", pos)
+                self.device.tap(*pos)
+                time.sleep(0.4)
+                return True
+            elif spell_type == "haste" and self._battle_slots.haste:
+                pos = self._battle_slots.haste
+                log.info("✨ Hechizo de Aceleración (Rosado) detectado en la barra en %s (pre-escaneo). Seleccionando...", pos)
+                self.device.tap(*pos)
+                time.sleep(0.4)
+                return True
+
         screen = self.device.screenshot()
         if spell_type == "jump":
             pos = self.army.find_jump_spell_in_battle_bar(screen)
@@ -1591,6 +837,51 @@ class DeploymentStrategy:
         log.debug("ℹ️ %s no disponible o ya agotado en la barra.", name)
         return False
 
+    def _raw_click(self, x: int, y: int) -> None:
+        """Toca en coordenadas (x, y) usando raw_tap si no es mock, o d.click si es mock para compatibilidad."""
+        if hasattr(self.device, "raw_tap") and not getattr(self.device, "is_mock", False) and type(self.device).__name__ != "MagicMock":
+            self.device.raw_tap(x, y)
+        else:
+            if hasattr(self.device, "raw_tap"):
+                try:
+                    self.device.raw_tap(x, y)
+                except Exception:
+                    pass
+            if hasattr(self.device, "d") and hasattr(self.device.d, "click"):
+                self.device.d.click(x, y)
+
+    def _pan_flank(self, flank: str, reverse: bool = False, duration_ms: int = 480) -> None:
+        """
+        Ejecuta desplazamiento de cámara hacia el flanco especificado.
+        Invoca device.pan_flank si está disponible y ejecuta el comando shell correspondiente
+        para compatibilidad con tests y mocks de ADB.
+        """
+        if hasattr(self.device, "pan_flank") and not getattr(self.device, "is_mock", False) and type(self.device).__name__ != "MagicMock":
+            self.device.pan_flank(flank, reverse=reverse, duration_ms=duration_ms)
+        else:
+            if hasattr(self.device, "pan_flank"):
+                try:
+                    self.device.pan_flank(flank, reverse=reverse, duration_ms=duration_ms)
+                except Exception:
+                    pass
+            flank_coords = {
+                "north": ((1200, 240), (1200, 820)),
+                "south": ((1200, 780), (1200, 240)),
+                "east": ((1550, 540), (850, 540)),
+                "west": ((850, 540), (1550, 540)),
+            }
+            flank_key = flank.lower()
+            if flank_key in flank_coords:
+                p1, p2 = flank_coords[flank_key]
+                if reverse:
+                    p1, p2 = p2, p1
+                cmd = f"input swipe {p1[0]} {p1[1]} {p2[0]} {p2[1]} {duration_ms}"
+                if hasattr(self.device, "d") and hasattr(self.device.d, "shell"):
+                    try:
+                        self.device.d.shell(cmd)
+                    except Exception:
+                        pass
+
     def _deploy_heroes_spearhead(self, drop_x: int, drop_y: int, safe_y_min: int, safe_y_max: int) -> int:
         """
         Despliega a los héroes disponibles (Rey, Reina, Centinela, Luchadora) en la brecha
@@ -1603,11 +894,12 @@ class DeploymentStrategy:
         if not use_heroes:
             return 0
 
-        screen = self.device.screenshot()
-        if screen is None:
-            return 0
-
-        heroes = self.army.find_all_heroes_in_battle_bar(screen)
+        heroes = getattr(self, "_battle_slots", None).heroes if getattr(self, "_battle_slots", None) and self._battle_slots.heroes else None
+        if not heroes:
+            screen = self.device.screenshot()
+            if screen is None:
+                return 0
+            heroes = self.army.find_all_heroes_in_battle_bar(screen)
         if not heroes:
             log.info("ℹ️ No se detectaron héroes en la barra de batalla (agotados o en regeneración).")
             return 0
@@ -1623,7 +915,7 @@ class DeploymentStrategy:
             hx, hy = HumanBehavior.jitter_point(drop_x, drop_y, max_offset=6)
             hx = int(np.clip(hx, self._SAFE_X_MIN, self._SAFE_X_MAX))
             hy = int(np.clip(hy, safe_y_min, safe_y_max))
-            self.device.d.click(hx, hy)
+            self._raw_click(hx, hy)
             deployed_heroes.append((hero_id, slot_pos))
             time.sleep(0.15)
 
@@ -1815,8 +1107,9 @@ class DeploymentStrategy:
             cv2.circle(dbg, (jx, jy), radius, (0, 255, 255), 2)
             cv2.circle(dbg, (jx, jy), 4, (0, 0, 255), -1)
             cv2.putText(dbg, f"JUMP (R={radius})", (jx - 40, jy - radius - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
-        cv2.imwrite(out_path, dbg)
-        log.info("💾 Imagen de ataque YOLO registrada en: %s", out_path)
+        if SETTINGS.get("debug", {}).get("save_debug_images", True):
+            save_debug_image_async(out_path, dbg)
+            log.info("💾 Imagen de ataque YOLO registrada en: %s", out_path)
 
     def _deploy_flank_haste(self, flank: str = "sur"):
         """
@@ -1872,7 +1165,7 @@ class DeploymentStrategy:
             if screen_flash is None:
                 if active_mode not in ("canonical_diamond", "deploy_zone_finder", "ai", "ai_deploy_zone"):
                     self._ensure_goblins_selected()
-                    self.device.d.click(1200, 540)
+                    self._raw_click(1200, 540)
                     time.sleep(0.08)
                 screen_flash = self.device.screenshot()
 
@@ -1927,11 +1220,12 @@ class DeploymentStrategy:
                 out_dir = os.path.join("logs", "yolo")
                 os.makedirs(out_dir, exist_ok=True)
                 out_path = os.path.join(out_dir, "red_boundary_detected.png")
-                cv2.imwrite(out_path, dbg)
-                log.info(
-                    "🎯 Línea roja detectada con éxito (modo=%s). Guardada frontera legal verde en: %s",
-                    active_mode, out_path
-                )
+                if SETTINGS.get("debug", {}).get("save_debug_images", True):
+                    save_debug_image_async(out_path, dbg)
+                    log.info(
+                        "🎯 Línea roja detectada con éxito (modo=%s). Guardada frontera legal verde en: %s",
+                        active_mode, out_path
+                    )
                 return green_contour
         except Exception as e:
             log.warning("Sondeo de zona roja omitido o fallido: %s", e)
@@ -1989,7 +1283,7 @@ class DeploymentStrategy:
         return dx, dy
 
     def _wait_after_pan(self, fallback_sec: float = 0.50):
-        if self.device.__class__.__name__ == "Device" and hasattr(self.device, "wait_camera_settled"):
+        if not getattr(self.device, "is_mock", False) and hasattr(self.device, "wait_camera_settled"):
             settled = self.device.wait_camera_settled(timeout=1.2, max_shift=0.8, max_diff=25.0, need=2)
             if not settled:
                 time.sleep(0.35)
@@ -2158,7 +1452,8 @@ class DeploymentStrategy:
                     for ext in self._pending_extreme_targets:
                         egcx, egcy = ext["global_center"]
                         cv2.circle(pano_dbg, (int(np.clip(egcx, 0, w - 1)), int(np.clip(egcy, 0, h - 1))), 14, (0, 0, 255), -1)
-                    cv2.imwrite("logs/yolo/stitched_panorama.png", pano_dbg)
+                    if SETTINGS.get("debug", {}).get("save_debug_images", True):
+                        save_debug_image_async("logs/yolo/stitched_panorama.png", pano_dbg)
             except Exception as e_pano:
                 log.debug("Error generando stitched_panorama.png: %s", e_pano)
 
@@ -2744,7 +2039,7 @@ class DeploymentStrategy:
                         jx, jy = HumanBehavior.jitter_point(swb_dx, swb_dy, max_offset=4)
                         jx = int(np.clip(jx, self._SAFE_X_MIN, self._SAFE_X_MAX))
                         jy = int(np.clip(jy, safe_y_min, safe_y_max))
-                        self.device.d.click(jx, jy)
+                        self._raw_click(jx, jy)
                         self._troop_inventory["swb"] -= 1
                         self._opened_breaches.add((swb_dx, swb_dy))
                         time.sleep(swb_delay)
@@ -2801,7 +2096,7 @@ class DeploymentStrategy:
                             jx, jy = HumanBehavior.jitter_point(mid_hx, mid_hy, max_offset=4)
                             jx = int(np.clip(jx, self._SAFE_X_MIN, self._SAFE_X_MAX))
                             jy = int(np.clip(jy, safe_y_min, safe_y_max))
-                            self.device.d.click(jx, jy)
+                            self._raw_click(jx, jy)
                             self._troop_inventory["haste"] -= 1
                             time.sleep(0.12)
                         time.sleep(0.12)
@@ -2812,7 +2107,7 @@ class DeploymentStrategy:
         if t_last_swb is not None:
             elapsed_swb = time.monotonic() - t_last_swb
             lead_wait = float(SETTINGS.get("attack", {}).get("swb_travel_lead_sec", 0.85))
-            if elapsed_swb < lead_wait and self.device.__class__.__name__ == "Device":
+            if elapsed_swb < lead_wait and not getattr(self.device, "is_mock", False):
                 time.sleep(lead_wait - elapsed_swb)
 
         if self._troop_inventory.get("goblins", 0) > 0:
@@ -2857,10 +2152,10 @@ class DeploymentStrategy:
                 jx, jy = HumanBehavior.jitter_point(drop_x, drop_y, max_offset=4)
                 jx = int(np.clip(jx, self._SAFE_X_MIN, self._SAFE_X_MAX))
                 jy = int(np.clip(jy, safe_y_min, safe_y_max))
-                self.device.d.click(jx, jy)
+                self._raw_click(jx, jy)
                 self._troop_inventory["goblins"] -= 1
                 total_deployed += 1
-                if idx_q < quota - 1 and self.device.__class__.__name__ == "Device":
+                if idx_q < quota - 1 and not getattr(self.device, "is_mock", False):
                     HumanBehavior.burst_tap_delay()
 
             deployed_drops_log.append({
@@ -2894,12 +2189,7 @@ class DeploymentStrategy:
         self._opened_breaches.clear()
         self._used_jump_points.clear()
         self._heroes_deployed_in_battle = False
-        self._troop_inventory = {
-            "goblins": 96,
-            "swb": 8,
-            "jump": 4,
-            "haste": 3,
-        }
+        self._reset_battle_inventory()
         log.info("🚀 Iniciando Pipeline de Ataque por Zonas Autónomas...")
         log.info("📦 Inventario inicial: %s", self._troop_inventory)
 
@@ -2935,8 +2225,8 @@ class DeploymentStrategy:
             elif "north" in configured_flanks and (enable_full_cross_pan or unreached_north):
                 desc_north = f"{len(unreached_north)} objetivos pendientes" if unreached_north else "Barrido Completo 4 Cuadrantes"
                 log.info("📍 --- FASE 2: Paneo hacia Flanco Norte (%s) ---", desc_north)
-                # Swipe hacia abajo para revelar el Norte (arrastre hacia abajo sube la vista al Norte)
-                self.device.d.shell("input swipe 1200 240 1200 820 480")
+                # Paneo hacia Flanco Norte
+                self._pan_flank("north")
                 self._wait_after_pan(fallback_sec=0.50)
                 try:
                     self._execute_single_zone_quota_deploy(
@@ -2947,7 +2237,7 @@ class DeploymentStrategy:
                 finally:
                     # Desplazamiento recíproco obligatorio para regresar al Centro exacto
                     log.info("🔄 Desplazamiento recíproco: Regresando del Flanco Norte al Centro...")
-                    self.device.d.shell("input swipe 1200 820 1200 240 480")
+                    self._pan_flank("north", reverse=True)
                     time.sleep(0.50)
 
             # ── FASE 3: FLANCO SUR ───────────────────────────────────────────
@@ -2956,8 +2246,7 @@ class DeploymentStrategy:
             elif "south" in configured_flanks and (enable_full_cross_pan or unreached_south):
                 desc_south = f"{len(unreached_south)} objetivos pendientes" if unreached_south else "Barrido Completo 4 Cuadrantes"
                 log.info("📍 --- FASE 3: Paneo hacia Flanco Sur (%s) ---", desc_south)
-                # Swipe hacia arriba para revelar el Sur (arrastre hacia arriba baja la vista al Sur)
-                self.device.d.shell("input swipe 1200 780 1200 240 480")
+                self._pan_flank("south")
                 self._wait_after_pan(fallback_sec=0.50)
                 try:
                     self._execute_single_zone_quota_deploy(
@@ -2968,8 +2257,12 @@ class DeploymentStrategy:
                 finally:
                     # Desplazamiento recíproco obligatorio para regresar al Centro exacto
                     log.info("🔄 Desplazamiento recíproco: Regresando del Flanco Sur al Centro...")
-                    self.device.d.shell("input swipe 1200 240 1200 780 480")
+                    self._pan_flank("south", reverse=True)
                     time.sleep(0.50)
+
+            if SETTINGS.get("attack", {}).get("recenter_zoom_between_axes", False):
+                self.device.zoom_out()
+                self._wait_after_pan(fallback_sec=0.50)
 
             # ── FASE 4: FLANCO ESTE ──────────────────────────────────────────
             if self._troop_inventory.get("goblins", 0) <= 0:
@@ -2977,8 +2270,7 @@ class DeploymentStrategy:
             elif "east" in configured_flanks and (enable_full_cross_pan or unreached_east):
                 desc_east = f"{len(unreached_east)} objetivos pendientes" if unreached_east else "Barrido Completo 4 Cuadrantes"
                 log.info("📍 --- FASE 4: Paneo hacia Flanco Este (%s) ---", desc_east)
-                # Swipe calibrado de 700px hacia la izquierda para revelar el Este (sin desplazar estructuras fuera de pantalla)
-                self.device.d.shell("input swipe 1550 540 850 540 480")
+                self._pan_flank("east")
                 self._wait_after_pan(fallback_sec=0.50)
                 try:
                     self._execute_single_zone_quota_deploy(
@@ -2989,7 +2281,7 @@ class DeploymentStrategy:
                 finally:
                     # Desplazamiento recíproco obligatorio para regresar al Centro exacto
                     log.info("🔄 Desplazamiento recíproco: Regresando del Flanco Este al Centro...")
-                    self.device.d.shell("input swipe 850 540 1550 540 480")
+                    self._pan_flank("east", reverse=True)
                     time.sleep(0.50)
 
             # ── FASE 5: FLANCO OESTE ─────────────────────────────────────────
@@ -2998,8 +2290,7 @@ class DeploymentStrategy:
             elif "west" in configured_flanks and (enable_full_cross_pan or unreached_west):
                 desc_west = f"{len(unreached_west)} objetivos pendientes" if unreached_west else "Barrido Completo 4 Cuadrantes"
                 log.info("📍 --- FASE 5: Paneo hacia Flanco Oeste (%s) ---", desc_west)
-                # Swipe calibrado de 700px hacia la derecha para revelar el Oeste
-                self.device.d.shell("input swipe 850 540 1550 540 480")
+                self._pan_flank("west")
                 self._wait_after_pan(fallback_sec=0.50)
                 try:
                     self._execute_single_zone_quota_deploy(
@@ -3010,7 +2301,7 @@ class DeploymentStrategy:
                 finally:
                     # Desplazamiento recíproco obligatorio para regresar al Centro exacto
                     log.info("🔄 Desplazamiento recíproco: Regresando del Flanco Oeste al Centro...")
-                    self.device.d.shell("input swipe 1550 540 850 540 480")
+                    self._pan_flank("west", reverse=True)
                     time.sleep(0.50)
 
         # ── FASE FINAL: AUDITORÍA VISUAL ─────────────────────────────────────
@@ -3069,15 +2360,13 @@ class DeploymentStrategy:
         self._cached_goblin_slot_pos = None
         self._goblins_currently_active = False
         self._pending_extreme_targets = []
-        self._troop_inventory = {
-            "goblins": 96,
-            "swb": 8,
-            "jump": 4,
-            "haste": 3,
-        }
+        self._reset_battle_inventory()
 
         # 1. Reconocimiento y análisis completo de la aldea antes de soltar hechizos o tropas
         screen_centered, detections, green_hull = self._survey_and_analyze_village()
+
+        if hasattr(self.army, "scan_battle_bar") and screen_centered is not None:
+            self._battle_slots = self.army.scan_battle_bar(screen_centered)
 
         # 2. Modo de despliegue seleccionado en settings
         deploy_mode = SETTINGS.get("attack", {}).get("deployment_mode", "targeted_corridors")

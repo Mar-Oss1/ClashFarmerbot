@@ -31,6 +31,12 @@
   },
   "attack": {
     "attack_strategy": "sneaky_farming",
+    "army_inventory": {
+      "goblins": 96,
+      "swb": 8,
+      "jump": 4,
+      "haste": 3
+    },
     "edrag_rush": {
       "loot_criteria": {
         "min_gold": 500000,
@@ -259,6 +265,7 @@
     "restart_app_on_failure": false
   },
   "debug": {
-    "search_only": false
+    "search_only": false,
+    "save_debug_images": true
   }
 }
