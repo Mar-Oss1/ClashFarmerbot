@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 
 from core.device import Device
-from core.vision import Vision
+from core.vision import Vision, save_debug_image_async
 from humanizer.behavior import HumanBehavior
 from core.logger import get_logger
 from core.config import SETTINGS
@@ -31,11 +31,17 @@ log = get_logger("edrag_strategy")
 class EDragStrategy:
     """Implementa la secuencia de ataque por el Triángulo Norte con Dragones Eléctricos y Furias."""
 
-    def __init__(self, device: Device, vision: Vision, human: HumanBehavior = None):
+    def __init__(
+        self,
+        device: Device,
+        vision: Vision,
+        human: HumanBehavior = None,
+        army_checker: ArmyChecker | None = None,
+    ):
         self.device = device
         self.vision = vision
         self.human = human or HumanBehavior()
-        self.army = ArmyChecker(self.vision)
+        self.army = army_checker or ArmyChecker(self.vision)
         self.w = device.width
         self.h = device.height
 
@@ -46,11 +52,17 @@ class EDragStrategy:
         self.hero_ability_delay_sec = float(cfg.get("hero_ability_delay_sec", 2.0))
         self._last_detections = []
 
-    def compute_north_triangle_drops(self, screen=None) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    def compute_north_triangle_drops(
+        self,
+        screen=None,
+        only_anchors: bool = False,
+    ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
         """
         Calcula puntos de despliegue legal en el césped exterior norte,
         altos y alejados de la línea roja construible a ambos lados del vértice norte.
         Con zoom moderado (mitad disponible), la superficie de césped exterior es enorme.
+        Si only_anchors=True, valida únicamente los 2 puntos ancla (nw_drops[1] y ne_drops[1])
+        ahorrando búsquedas y cómputo de IA innecesarios para puntos que no se despliegan.
         """
         safe_top_y = 145
         if screen is not None:
@@ -92,18 +104,27 @@ class EDragStrategy:
                 if dz and dz.is_ready():
                     mask = dz.predict_mask(screen)
                     if mask is not None:
-                        nw_drops = [
-                            dz.find_closest_deployable_point(pt[0], pt[1], margin_px=25, mask=mask)
-                            if not dz.is_point_deployable(pt[0], pt[1], mask=mask, safety_margin_px=15)
-                            else pt
-                            for pt in nw_drops
-                        ]
-                        ne_drops = [
-                            dz.find_closest_deployable_point(pt[0], pt[1], margin_px=25, mask=mask)
-                            if not dz.is_point_deployable(pt[0], pt[1], mask=mask, safety_margin_px=15)
-                            else pt
-                            for pt in ne_drops
-                        ]
+                        if only_anchors:
+                            # Validar únicamente los 2 puntos ancla de ataque
+                            pt_nw = nw_drops[1]
+                            if not dz.is_point_deployable(pt_nw[0], pt_nw[1], mask=mask, safety_margin_px=15):
+                                nw_drops[1] = dz.find_closest_deployable_point(pt_nw[0], pt_nw[1], margin_px=25, mask=mask)
+                            pt_ne = ne_drops[1]
+                            if not dz.is_point_deployable(pt_ne[0], pt_ne[1], mask=mask, safety_margin_px=15):
+                                ne_drops[1] = dz.find_closest_deployable_point(pt_ne[0], pt_ne[1], margin_px=25, mask=mask)
+                        else:
+                            nw_drops = [
+                                dz.find_closest_deployable_point(pt[0], pt[1], margin_px=25, mask=mask)
+                                if not dz.is_point_deployable(pt[0], pt[1], mask=mask, safety_margin_px=15)
+                                else pt
+                                for pt in nw_drops
+                            ]
+                            ne_drops = [
+                                dz.find_closest_deployable_point(pt[0], pt[1], margin_px=25, mask=mask)
+                                if not dz.is_point_deployable(pt[0], pt[1], mask=mask, safety_margin_px=15)
+                                else pt
+                                for pt in ne_drops
+                            ]
                         log.info("🛡️ DeployZoneDetector validó puntos del Triángulo Norte (IA activa)")
             except Exception as e:
                 log.debug("DeployZoneDetector en EDrag check omitido: %s", e)
@@ -216,16 +237,23 @@ class EDragStrategy:
             log.error("❌ No se pudo capturar la pantalla para el ataque.")
             return False
 
-        # Guardar captura inicial del ataque tras el paneo
+        # Guardar captura inicial del ataque tras el paneo de forma asíncrona
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = os.path.join("logs", "yolo")
-        os.makedirs(out_dir, exist_ok=True)
-        cv2.imwrite(os.path.join(out_dir, f"edrag_attack_start_{ts}.png"), screen)
+        save_debug_image_async(f"logs/yolo/edrag_attack_start_{ts}.png", screen)
 
-        # 3. Localizar tropas, hechizos y héroes en la barra de batalla
-        edrag_pos = self.army.find_edrag_in_battle_bar(screen)
-        rage_pos = self.army.find_rage_spell_in_battle_bar(screen)
-        heroes = self.army.find_all_heroes_in_battle_bar(screen)
+        # 3. Localizar tropas, hechizos y héroes en la barra de batalla (escaneo único)
+        slots = self.army.scan_battle_bar(screen)
+        edrag_pos = slots.edrag
+        if edrag_pos is None and hasattr(self.army, "find_edrag_in_battle_bar"):
+            edrag_pos = self.army.find_edrag_in_battle_bar(screen)
+
+        rage_pos = slots.rage
+        if rage_pos is None and hasattr(self.army, "find_rage_spell_in_battle_bar"):
+            rage_pos = self.army.find_rage_spell_in_battle_bar(screen)
+
+        heroes = slots.heroes
+        if not heroes and hasattr(self.army, "find_all_heroes_in_battle_bar"):
+            heroes = self.army.find_all_heroes_in_battle_bar(screen)
 
         log.info("📦 Reconocimiento de barra de batalla:")
         log.info("   • Dragones Eléctricos : %s", edrag_pos)
@@ -240,7 +268,7 @@ class EDragStrategy:
             log.warning("⚠️ No se detectó ranura dinámica de Furia. Usando ranura estándar en (1345, 960)...")
             rage_pos = (1345, 960)
 
-        nw_drops, ne_drops = self.compute_north_triangle_drops(screen)
+        nw_drops, ne_drops = self.compute_north_triangle_drops(screen, only_anchors=True)
 
         # ─────────────────────────────────────────────────────────────
         # FASE 1: HECHIZOS DE FURIA DE APERTURA (Escalonado Táctico)
@@ -335,10 +363,10 @@ class EDragStrategy:
                 self._tap_jitter(c_pt[0], c_pt[1])
                 time.sleep(0.20)
 
-        # Guardar captura final del despliegue completado
+        # Guardar captura final del despliegue completado de forma asíncrona
         s_deployed = self.device.screenshot()
         if s_deployed is not None:
-            cv2.imwrite(os.path.join(out_dir, f"edrag_attack_deployed_{ts}.png"), s_deployed)
+            save_debug_image_async(f"logs/yolo/edrag_attack_deployed_{ts}.png", s_deployed)
 
         log.info("🚀 Despliegue de Dragones Eléctricos, Furias y Héroes completado con éxito.")
         return True

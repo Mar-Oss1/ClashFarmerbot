@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 import cv2
 from core.vision import Vision
-from vision.army_checker import ArmyChecker
+from vision.army_checker import ArmyChecker, BattleBarSlots
 
 
 class TestArmyChecker(unittest.TestCase):
@@ -97,6 +97,76 @@ class TestArmyChecker(unittest.TestCase):
         self.assertEqual(x_positions, sorted(x_positions), "Las ranuras deben estar ordenadas de izq a der")
         hero_keys = list(heroes.keys())
         self.assertEqual(hero_keys, ["champion", "minion_prince", "warden"])
+
+    def test_scan_battle_bar_simultaneous_detection(self):
+        """
+        Verifica que scan_battle_bar detecte simultáneamente tropas, hechizos y héroes
+        en un único frame sintético sin múltiples lecturas de disco.
+        """
+        templates = [
+            ("goblin", self.checker.tpl_goblin_slot, 300),
+            ("swb", self.checker.tpl_swb_slot, 460),
+            ("edrag", self.checker.tpl_edrag_slot, 620),
+            ("jump", self.checker.tpl_spell_jump, 780),
+            ("rage", self.checker.tpl_spell_rage, 940),
+            ("haste", self.checker.tpl_spell_haste, 1100),
+            ("champion", self.checker.tpl_hero_champion, 1260),
+            ("minion_prince", self.checker.tpl_hero_minion_prince, 1420),
+            ("warden", self.checker.tpl_hero_warden, 1580),
+        ]
+
+        frame = np.zeros((1080, 2400, 3), dtype=np.uint8)
+        y_pos = 920
+        expected_centers = {}
+
+        for name, tpl_path, x_pos in templates:
+            tpl = cv2.imread(tpl_path)
+            if tpl is not None:
+                th, tw = tpl.shape[:2]
+                frame[y_pos:y_pos+th, x_pos:x_pos+tw] = tpl
+                expected_centers[name] = (x_pos + tw // 2, y_pos + th // 2)
+
+        slots = self.checker.scan_battle_bar(frame)
+        self.assertIsInstance(slots, BattleBarSlots)
+
+        # Verificar detección de cada componente en su centroide exacto
+        self.assertIsNotNone(slots.goblin, "Debe detectar ranura de duendes")
+        self.assertAlmostEqual(slots.goblin[0], expected_centers["goblin"][0], delta=5)
+        self.assertAlmostEqual(slots.goblin[1], expected_centers["goblin"][1], delta=5)
+
+        self.assertIsNotNone(slots.swb, "Debe detectar ranura de SWB")
+        self.assertAlmostEqual(slots.swb[0], expected_centers["swb"][0], delta=5)
+
+        self.assertIsNotNone(slots.edrag, "Debe detectar ranura de E-Drag")
+        self.assertAlmostEqual(slots.edrag[0], expected_centers["edrag"][0], delta=5)
+
+        self.assertIsNotNone(slots.jump, "Debe detectar hechizo de Salto")
+        self.assertAlmostEqual(slots.jump[0], expected_centers["jump"][0], delta=5)
+
+        self.assertIsNotNone(slots.rage, "Debe detectar hechizo de Furia")
+        self.assertAlmostEqual(slots.rage[0], expected_centers["rage"][0], delta=5)
+
+        self.assertIsNotNone(slots.haste, "Debe detectar hechizo de Aceleración")
+        self.assertAlmostEqual(slots.haste[0], expected_centers["haste"][0], delta=5)
+
+        # Héroes simultáneos
+        self.assertIn("champion", slots.heroes)
+        self.assertIn("minion_prince", slots.heroes)
+        self.assertIn("warden", slots.heroes)
+        self.assertEqual(len(slots.heroes), 3)
+
+    def test_scan_battle_bar_none_or_empty(self):
+        """Verifica que un screenshot nulo o vacío retorne BattleBarSlots vacío de forma segura."""
+        slots_none = self.checker.scan_battle_bar(None)
+        self.assertIsInstance(slots_none, BattleBarSlots)
+        self.assertIsNone(slots_none.goblin)
+        self.assertEqual(slots_none.heroes, {})
+
+        empty_frame = np.zeros((1080, 2400, 3), dtype=np.uint8)
+        slots_empty = self.checker.scan_battle_bar(empty_frame)
+        self.assertIsInstance(slots_empty, BattleBarSlots)
+        self.assertIsNone(slots_empty.goblin)
+        self.assertEqual(slots_empty.heroes, {})
 
 
 if __name__ == "__main__":

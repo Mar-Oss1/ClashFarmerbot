@@ -42,7 +42,7 @@ class ClashStateMachine:
         self.damage_reader = DamageReader()
         self.army = ArmyChecker(vision)
         self.deployer = DeploymentStrategy(device, vision, self.army)
-        self.edrag_deployer = EDragStrategy(device, vision)
+        self.edrag_deployer = EDragStrategy(device, vision, army_checker=self.army)
         self.active_army_type = "sneaky_farming"
         self.wall_upgrader = WallUpgrader(device, vision)
         self.ui_cache = UICache()

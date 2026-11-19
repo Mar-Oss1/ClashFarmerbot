@@ -170,6 +170,47 @@ class TestEDragStrategy(unittest.TestCase):
         slot_taps = [call[0] for call in self.mock_device.tap.call_args_list if call[0] in [(725, 960), (880, 960)]]
         self.assertEqual(len(slot_taps), 4)
 
+    def test_init_accepts_injected_army_checker(self):
+        """Verifica que EDragStrategy acepte e inyecte una instancia externa de ArmyChecker."""
+        custom_army = ArmyChecker(self.vision)
+        strat = EDragStrategy(self.mock_device, self.vision, army_checker=custom_army)
+        self.assertIs(strat.army, custom_army)
+
+    def test_execute_attack_uses_async_debug_save(self):
+        """Verifica que execute_attack guarde capturas vía save_debug_image_async sin llamadas síncronas a cv2.imwrite."""
+        army = self.strategy.army
+        army.find_edrag_in_battle_bar = MagicMock(return_value=(407, 955))
+        army.find_rage_spell_in_battle_bar = MagicMock(return_value=(1345, 960))
+        army.find_all_heroes_in_battle_bar = MagicMock(return_value={})
+
+        self.strategy.rage_core_delay_sec = 0.01
+        self.strategy.hero_ability_delay_sec = 0.01
+
+        with unittest.mock.patch("attack.edrag_strategy.save_debug_image_async") as mock_save_async, \
+             unittest.mock.patch("cv2.imwrite") as mock_imwrite:
+            success = self.strategy.execute_attack()
+            self.assertTrue(success)
+            self.assertGreaterEqual(mock_save_async.call_count, 2)
+            mock_imwrite.assert_not_called()
+
+    def test_compute_north_triangle_drops_only_anchors_efficiency(self):
+        """Verifica que only_anchors=True solo consulte DeployZoneDetector para los 2 puntos ancla."""
+        mock_dz = MagicMock()
+        mock_dz.is_ready.return_value = True
+        mock_dz.predict_mask.return_value = np.zeros((1080, 2400), dtype=np.uint8)
+        mock_dz.is_point_deployable.return_value = True
+
+        with unittest.mock.patch("vision.deploy_zone_detector.get_deploy_zone_detector", return_value=mock_dz):
+            # 1. only_anchors=True -> exactamente 2 llamadas
+            nw_anchors, ne_anchors = self.strategy.compute_north_triangle_drops(self.dummy_screen, only_anchors=True)
+            self.assertEqual(mock_dz.is_point_deployable.call_count, 2)
+
+            mock_dz.is_point_deployable.reset_mock()
+
+            # 2. only_anchors=False (compatibilidad) -> 10 llamadas (5 NW + 5 NE)
+            nw_all, ne_all = self.strategy.compute_north_triangle_drops(self.dummy_screen, only_anchors=False)
+            self.assertEqual(mock_dz.is_point_deployable.call_count, 10)
+
 
 if __name__ == "__main__":
     unittest.main()

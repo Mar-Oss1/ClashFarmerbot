@@ -22,7 +22,10 @@ _RECONNECT_WAIT = 5
 
 
 class Device:
+    is_mock: bool = False
+
     def __init__(self, serial: str = DEVICE_SERIAL):
+        self.is_mock = False
         self.serial = serial
         self.d: u2.Device | None = None
         self.width: int = 2400
@@ -104,6 +107,21 @@ class Device:
                 log.warning("Error en tap(%d, %d): %s", tx, ty, e)
                 if not self._reconnect():
                     raise RuntimeError("ADB caido en tap.") from e
+
+    def raw_tap(self, x: int | float, y: int | float):
+        """Alias explícito para tocar sin jitter ni humanización."""
+        return self.tap(x, y, humanize=False)
+
+    def press_back(self):
+        """Envía el evento de botón Atrás por ADB con reintentos y reconexión."""
+        for intento in range(_MAX_RECONNECT):
+            try:
+                self.d.press("back")
+                return
+            except Exception as e:
+                log.warning("Error en press_back (intento %d): %s", intento + 1, e)
+                if not self._reconnect():
+                    raise RuntimeError("ADB caido en press_back.") from e
 
     def swipe(self, x1: int, y1: int, x2: int, y2: int, duration: float = 0.5):
         for intento in range(_MAX_RECONNECT):
@@ -243,6 +261,34 @@ class Device:
 
         self.swipe(sx1, sy1, sx2, sy2, duration=duration)
         time.sleep(0.5)
+
+    def pan_flank(self, flank: str, reverse: bool = False, duration_ms: int = 480) -> None:
+        """
+        Ejecuta un desplazamiento suave hacia el flanco especificado ('north', 'south', 'east', 'west')
+        calculando coordenadas proporcionales a la resolución del dispositivo.
+        Si reverse=True, invierte el origen y destino del desplazamiento.
+        """
+        flank_coords = {
+            "north": ((0.50, 0.222), (0.50, 0.759)),
+            "south": ((0.50, 0.722), (0.50, 0.222)),
+            "east": ((0.646, 0.50), (0.354, 0.50)),
+            "west": ((0.354, 0.50), (0.646, 0.50)),
+        }
+        flank_key = flank.lower()
+        if flank_key not in flank_coords:
+            log.warning("Flanco '%s' desconocido en pan_flank. Omitiendo desplazamiento.", flank)
+            return
+
+        p1, p2 = flank_coords[flank_key]
+        if reverse:
+            p1, p2 = p2, p1
+
+        x1 = int(round(p1[0] * self.width))
+        y1 = int(round(p1[1] * self.height))
+        x2 = int(round(p2[0] * self.width))
+        y2 = int(round(p2[1] * self.height))
+
+        self.swipe(x1, y1, x2, y2, duration=duration_ms / 1000.0)
 
     def wait_camera_settled(self, timeout=2.5, interval=0.10, max_shift=0.8, max_diff=25.0, need=2) -> bool:
         prev, ok, t0 = None, 0, time.monotonic()
