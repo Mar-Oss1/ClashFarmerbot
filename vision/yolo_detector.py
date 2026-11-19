@@ -107,7 +107,14 @@ class YoloDetector:
         try:
             if resolved_path.lower().endswith(".onnx"):
                 import onnxruntime as ort
-                self.session = ort.InferenceSession(resolved_path, providers=["CPUExecutionProvider"])
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads = min(4, os.cpu_count() or 2)
+                opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                self.session = ort.InferenceSession(
+                    resolved_path,
+                    sess_options=opts,
+                    providers=["CPUExecutionProvider"]
+                )
                 self.input_name = self.session.get_inputs()[0].name
                 out_shape = self.session.get_outputs()[0].shape
                 # En YOLOv8 ONNX: [1, 4 + nc, num_candidates] o [1, num_candidates, 4 + nc]

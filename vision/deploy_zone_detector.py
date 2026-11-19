@@ -44,6 +44,8 @@ class DeployZoneDetector:
         self.last_mask: Optional[np.ndarray] = None
         self.last_prob: Optional[np.ndarray] = None
         self.last_contours: Optional[List[np.ndarray]] = None
+        self._last_dist_map: Optional[np.ndarray] = None
+        self._boundary_pts_cache: dict[tuple, np.ndarray] = {}
 
         # Parámetros de normalización ImageNet (idénticos al entrenamiento)
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -68,6 +70,7 @@ class DeployZoneDetector:
             # Inferencia óptima en CPU
             opts = ort.SessionOptions()
             opts.intra_op_num_threads = min(4, os.cpu_count() or 2)
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             self.session = ort.InferenceSession(
                 resolved_path,
                 sess_options=opts,
@@ -141,6 +144,15 @@ class DeployZoneDetector:
 
             self.last_prob = prob_full
             self.last_mask = binary_mask
+
+            if getattr(self, "_boundary_pts_cache", None) is not None:
+                self._boundary_pts_cache.clear()
+            else:
+                self._boundary_pts_cache = {}
+
+            self._last_dist_map = cv2.distanceTransform(
+                (binary_mask == 0).astype(np.uint8), cv2.DIST_L2, 5
+            )
 
             # Extraer contornos del borde
             contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -269,34 +281,62 @@ class DeployZoneDetector:
             if xmin <= target_x <= xmax and ymin <= target_y <= ymax:
                 return (target_x, target_y)
 
-        # Distancia euclidiana usando distanceTransform invertido
-        deployable_map = (active_mask == 0).astype(np.uint8)
-        dist_map = cv2.distanceTransform(deployable_map, cv2.DIST_L2, 5)
+        # Asegurar diccionario de caché incluso si el detector fue creado con __new__
+        if getattr(self, "_boundary_pts_cache", None) is None:
+            self._boundary_pts_cache = {}
 
-        # Máscara donde el margen de seguridad es válido
-        safe_deployable = (dist_map >= margin_px).astype(np.uint8)
+        # Reutilizar mapa de distancias si corresponde
+        is_same_as_last = mask is None or (
+            getattr(self, "last_mask", None) is not None and mask is self.last_mask
+        )
+        if (
+            is_same_as_last
+            and getattr(self, "_last_dist_map", None) is not None
+            and self._last_dist_map.shape == active_mask.shape[:2]
+        ):
+            dist_map = self._last_dist_map
+        else:
+            deployable_map = (active_mask == 0).astype(np.uint8)
+            dist_map = cv2.distanceTransform(deployable_map, cv2.DIST_L2, 5)
+            if is_same_as_last:
+                self._last_dist_map = dist_map
 
-        # Filtrar límites de toque activo de pantalla para evitar barra de notificaciones y slots
-        if safe_bounds is not None:
-            xmin, ymin, xmax, ymax = safe_bounds
-            safe_deployable[:ymin, :] = 0
-            safe_deployable[ymax:, :] = 0
-            safe_deployable[:, :xmin] = 0
-            safe_deployable[:, xmax:] = 0
+        cache_key = (margin_px, safe_bounds)
+        boundary_pts = self._boundary_pts_cache.get(cache_key)
 
-        # Buscar en un radio circular alrededor del objetivo
-        y_indices, x_indices = np.where(safe_deployable == 1)
-        if len(x_indices) == 0:
+        if boundary_pts is None:
+            # Máscara donde el margen de seguridad es válido
+            safe_deployable = (dist_map >= margin_px).astype(np.uint8)
+
+            # Filtrar límites de toque activo de pantalla para evitar barra de notificaciones y slots
+            if safe_bounds is not None:
+                xmin, ymin, xmax, ymax = safe_bounds
+                safe_deployable[:ymin, :] = 0
+                safe_deployable[ymax:, :] = 0
+                safe_deployable[:, :xmin] = 0
+                safe_deployable[:, xmax:] = 0
+
+            # Extraer únicamente píxeles de frontera/contorno (frontera geométrica exterior)
+            contours, _ = cv2.findContours(safe_deployable, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+            if contours:
+                boundary_pts = np.vstack([c.reshape(-1, 2) for c in contours])
+            else:
+                boundary_pts = np.empty((0, 2), dtype=np.int32)
+
+            self._boundary_pts_cache[cache_key] = boundary_pts
+
+        if len(boundary_pts) == 0:
             if safe_bounds is not None:
                 xmin, ymin, xmax, ymax = safe_bounds
                 return int(np.clip(target_x, xmin, xmax)), int(np.clip(target_y, ymin, ymax))
             return (target_x, target_y)
 
-        dists_sq = (x_indices - target_x) ** 2 + (y_indices - target_y) ** 2
+        # Distancia euclidiana mínima contra el array compacto de puntos de frontera
+        dists_sq = (boundary_pts[:, 0] - target_x) ** 2 + (boundary_pts[:, 1] - target_y) ** 2
         min_idx = np.argmin(dists_sq)
 
-        best_x = int(x_indices[min_idx])
-        best_y = int(y_indices[min_idx])
+        best_x = int(boundary_pts[min_idx, 0])
+        best_y = int(boundary_pts[min_idx, 1])
         return (best_x, best_y)
 
     def get_overlay_visualization(self, screenshot: np.ndarray) -> np.ndarray:

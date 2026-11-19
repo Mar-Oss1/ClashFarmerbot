@@ -9,7 +9,7 @@ import time
 import cv2
 import numpy as np
 from core.config import SETTINGS, PROJECT_ROOT
-from core.vision import Vision
+from core.vision import Vision, save_debug_image_async
 from core.logger import get_logger
 
 log = get_logger("resource_reader")
@@ -24,6 +24,8 @@ class ResourceReader:
         self.enemy_rois = SETTINGS["rois"]["enemy_loot"]
         self.own_rois = SETTINGS["rois"]["own_resources"]
         self._bank: list[tuple[int, np.ndarray]] | None = None
+        self._bank_by_scale: dict[float, list[tuple[int, np.ndarray]]] = {}
+        self._preferred_scale: dict[str, float] = {}
 
     @staticmethod
     def _binarize_white_digits(gray_img: np.ndarray, adaptive: bool = False) -> np.ndarray:
@@ -51,24 +53,42 @@ class ResourceReader:
         cropped = tpl_bin[y:y + h, x:x + w]
         return cv2.copyMakeBorder(cropped, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
 
+    def _populate_banks(self) -> None:
+        if self._bank_by_scale:
+            return
+        self._bank_by_scale = {s: [] for s in SCALES}
+        self._bank = []
+        for digit, path in self.digit_templates.items():
+            cached = self.vision._load_template(path)
+            if cached is None:
+                continue
+            tpl_gray, _ = cached
+            for s in SCALES:
+                t = self._prepare_scaled_template(tpl_gray, s)
+                if t is not None:
+                    self._bank_by_scale[s].append((digit, t))
+                    self._bank.append((digit, t))
+
     def _get_bank(self) -> list[tuple[int, np.ndarray]]:
         if self._bank is None:
-            self._bank = []
-            for digit, path in self.digit_templates.items():
-                cached = self.vision._load_template(path)
-                if cached is None:
-                    continue
-                tpl_gray, _ = cached
-                for s in SCALES:
-                    t = self._prepare_scaled_template(tpl_gray, s)
-                    if t is not None:
-                        self._bank.append((digit, t))
+            self._populate_banks()
         return self._bank
 
-    def _candidates(self, roi_bin: np.ndarray, floor: float = 0.65) -> list[tuple[int, float, int, int]]:
+    def _get_bank_for_scale(self, scale: float) -> list[tuple[int, np.ndarray]]:
+        if not self._bank_by_scale:
+            self._populate_banks()
+        return self._bank_by_scale.get(scale, [])
+
+    def _candidates(
+        self,
+        roi_bin: np.ndarray,
+        floor: float = 0.65,
+        bank: list[tuple[int, np.ndarray]] | None = None,
+    ) -> list[tuple[int, float, int, int]]:
         rh, rw = roi_bin.shape[:2]
         out: list[tuple[int, float, int, int]] = []
-        for digit, tpl in self._get_bank():
+        active_bank = bank if bank is not None else self._get_bank()
+        for digit, tpl in active_bank:
             th, tw = tpl.shape[:2]
             if th >= rh or tw >= rw or th < 8 or tw < 4:
                 continue
@@ -110,23 +130,81 @@ class ResourceReader:
         fail_dir = os.path.join(PROJECT_ROOT, "logs", "fails")
         os.makedirs(fail_dir, exist_ok=True)
         ts = int(time.time() * 1000)
-        cv2.imwrite(os.path.join(fail_dir, f"{ts}_{key}_gray.png"), roi_gray)
-        cv2.imwrite(os.path.join(fail_dir, f"{ts}_{key}_bin.png"), roi_bin)
+        save_debug_image_async(os.path.join(fail_dir, f"{ts}_{key}_gray.png"), roi_gray)
+        save_debug_image_async(os.path.join(fail_dir, f"{ts}_{key}_bin.png"), roi_bin)
+
+        # Rotación simple: no superar 200 archivos en logs/fails/
+        try:
+            files = [
+                os.path.join(fail_dir, f)
+                for f in os.listdir(fail_dir)
+                if f.endswith(".png")
+            ]
+            if len(files) > 200:
+                files.sort(key=os.path.getmtime)
+                for old_f in files[: len(files) - 200]:
+                    try:
+                        os.remove(old_f)
+                    except OSError:
+                        pass
+        except Exception as e_rot:
+            log.debug("Error en rotación de logs/fails/: %s", e_rot)
 
     def _read_number_from_roi(self, roi_gray: np.ndarray, key: str = "") -> int | None:
         roi_bin = self._binarize_white_digits(roi_gray, adaptive=True)
         roi_bin = cv2.copyMakeBorder(roi_bin, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=0)
-        cands = self._candidates(roi_bin, floor=0.65)
 
+        cat = "general"
+        if "tooltip" in key:
+            cat = "tooltip"
+        elif "enemy" in key:
+            cat = "enemy"
+        elif "own" in key:
+            cat = "own"
+
+        # 1. Probar primero la escala preferida si ya se conoce para esta categoría
+        pref_scale = self._preferred_scale.get(cat)
+        if pref_scale is not None:
+            cands_pref = self._candidates(roi_bin, floor=0.74, bank=self._get_bank_for_scale(pref_scale))
+            dets_pref = self._nms(cands_pref, thr=0.74)
+            if self._valid_grouping(dets_pref):
+                return int("".join(str(d[1]) for d in dets_pref))
+
+        # 2. Fallback: probar todas las escalas y registrar la escala ganadora
+        best_scale = None
+        best_val = None
+        best_score = -1.0
+
+        for s in SCALES:
+            cands_s = self._candidates(roi_bin, floor=0.65, bank=self._get_bank_for_scale(s))
+            if not cands_s:
+                continue
+            for thr in (0.80, 0.74, 0.68, 0.65):
+                dets_s = self._nms(cands_s, thr)
+                if self._valid_grouping(dets_s):
+                    avg_score = float(np.mean([d[3] for d in dets_s]))
+                    if avg_score > best_score:
+                        best_score = avg_score
+                        best_scale = s
+                        best_val = int("".join(str(d[1]) for d in dets_s))
+                    break
+
+        if best_val is not None:
+            if best_scale is not None:
+                self._preferred_scale[cat] = best_scale
+            return best_val
+
+        # 3. Fallback global sobre el banco combinado por si se requieren templates múltiples
+        cands_global = self._candidates(roi_bin, floor=0.65)
         for thr in (0.80, 0.74, 0.68, 0.65):
-            dets = self._nms(cands, thr)
+            dets = self._nms(cands_global, thr)
             if self._valid_grouping(dets):
                 return int("".join(str(d[1]) for d in dets))
 
         self._dump_fail(roi_gray, roi_bin, key)
         return None
 
-    def _extract_rois(self, screenshot, roi_map: dict) -> dict[str, int | None]:
+    def _extract_rois(self, screenshot, roi_map: dict, category: str = "") -> dict[str, int | None]:
         if isinstance(screenshot, np.ndarray) and screenshot.ndim == 3:
             screen_gray = np.min(screenshot[:, :, :3], axis=2)
         else:
@@ -137,7 +215,8 @@ class ResourceReader:
 
         for key, (ry1, ry2, rx1, rx2) in roi_map.items():
             roi = screen_gray[int(h * ry1):int(h * ry2), int(w * rx1):int(w * rx2)]
-            result[key] = self._read_number_from_roi(roi, key)
+            composite_key = f"{category}_{key}" if category else key
+            result[key] = self._read_number_from_roi(roi, composite_key)
         return result
 
     @staticmethod
@@ -145,7 +224,7 @@ class ResourceReader:
         return f"{val:,}" if val is not None else "??"
 
     def read_enemy_loot(self, screenshot) -> dict[str, int | None]:
-        loot = self._extract_rois(screenshot, self.enemy_rois)
+        loot = self._extract_rois(screenshot, self.enemy_rois, category="enemy")
         log.info(
             "🔎 Botín Enemigo -> Oro: %s | Elixir: %s | Oscuro: %s",
             self._format_resource(loot.get("gold")),
@@ -164,7 +243,7 @@ class ResourceReader:
         streak = 0
 
         while time.monotonic() - t0 < timeout:
-            loot = self._extract_rois(screenshot_fn(), self.enemy_rois)
+            loot = self._extract_rois(screenshot_fn(), self.enemy_rois, category="enemy")
             if all(v is not None for v in loot.values()):
                 if loot == last:
                     streak += 1
@@ -183,7 +262,7 @@ class ResourceReader:
         return None
 
     def read_own_resources(self, screenshot) -> dict[str, int]:
-        rss = self._extract_rois(screenshot, self.own_rois)
+        rss = self._extract_rois(screenshot, self.own_rois, category="own")
         cleaned = {k: (v if v is not None else 0) for k, v in rss.items()}
         log.info(
             "🏦 Recursos Propios -> Oro: %s | Elixir: %s | Oscuro: %s",
@@ -490,7 +569,7 @@ class ResourceReader:
         try:
             save_dir = os.path.join(PROJECT_ROOT, "logs", "tooltips")
             os.makedirs(save_dir, exist_ok=True)
-            cv2.imwrite(os.path.join(save_dir, f"tooltip_{resource_type}.png"), screen)
+            save_debug_image_async(os.path.join(save_dir, f"tooltip_{resource_type}.png"), screen)
         except Exception as e_save:
             log.debug("Error guardando captura de tooltip: %s", e_save)
 

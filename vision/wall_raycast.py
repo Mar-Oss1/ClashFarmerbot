@@ -7,9 +7,11 @@ y tolerancia colineal de extremos).
 from __future__ import annotations
 import math
 import os
+import zlib
 import cv2
 import numpy as np
 from core.logger import get_logger
+from core.vision import save_debug_image_async
 
 log = get_logger("wall_raycast")
 
@@ -17,6 +19,25 @@ log = get_logger("wall_raycast")
 _ISO_ANGLES_CACHE: tuple[float, float] | None = None
 _WALL_SEGMENTS_CACHE: list[tuple[int, int, int, int]] | None = None
 _LAST_SCREEN_HASH: int | None = None
+
+
+def _compute_frame_fingerprint(img: np.ndarray) -> int:
+    """
+    Calcula una huella digital determinista, rápida (<0.1 ms) y sensible a cambios de aldea:
+    1. Recorta la región central de la aldea (y: 15%..85%, x: 15%..85%).
+    2. Reduce con cv2.resize a (32, 16) con INTER_AREA.
+    3. Retorna zlib.adler32 de los bytes del thumbnail.
+    """
+    if img is None or getattr(img, "size", 0) == 0:
+        return 0
+    h, w = img.shape[:2]
+    y1, y2 = int(0.15 * h), int(0.85 * h)
+    x1, x2 = int(0.15 * w), int(0.85 * w)
+    center_crop = img[y1:y2, x1:x2]
+    if center_crop.size == 0:
+        return 0
+    thumb = cv2.resize(center_crop, (32, 16), interpolation=cv2.INTER_AREA)
+    return zlib.adler32(thumb.tobytes())
 
 
 def reset_iso_angles_cache() -> None:
@@ -59,7 +80,7 @@ def detect_global_wall_segments(
     if img is None or img.size == 0:
         return (36.0, 144.0), []
 
-    screen_hash = hash(img.tobytes()[:2048])
+    screen_hash = _compute_frame_fingerprint(img)
     if (
         not force_refresh
         and _ISO_ANGLES_CACHE is not None
@@ -641,6 +662,6 @@ def draw_wall_raycast_debug(
             2
         )
 
-    cv2.imwrite(out_path, canvas)
+    save_debug_image_async(out_path, canvas)
     log.info("📸 Debug visual de Wall Raycast guardado en: %s", out_path)
 

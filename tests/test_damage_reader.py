@@ -55,13 +55,15 @@ class TestDamageReader(unittest.TestCase):
         self.assertIn(pct, (44, 50, 54, 55, 57, 61, 62), f"Debe leer porcentaje válido ({pct})")
 
     def test_read_sample_progress_atk4(self):
-        """Verifica la lectura de porcentaje en battle_progress_atk4."""
-        path = os.path.join(PROJECT_ROOT, "logs", "runs", "battle_progress_atk4.png")
+        """Verifica la lectura de porcentaje en sample_damage_49.png (49%)."""
+        path = os.path.join(PROJECT_ROOT, "tests", "fixtures", "sample_damage_49.png")
+        if not os.path.exists(path):
+            path = os.path.join(PROJECT_ROOT, "logs", "runs", "battle_progress_atk4.png")
         if not os.path.exists(path):
             self.skipTest(f"Captura {path} no encontrada")
         img = cv2.imread(path)
         pct = self.reader.read_destruction_percentage(img)
-        self.assertIn(pct, (39, 52, 54, 55, 58, 68), f"Debe leer porcentaje válido ({pct})")
+        self.assertEqual(pct, 49, f"Debe leer exactamente 49% ({pct})")
 
     def test_invalid_and_blank_screens(self):
         """Verifica que pantallas nulas, vacías o negras retornan None."""
