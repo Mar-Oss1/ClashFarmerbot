@@ -210,7 +210,9 @@
         "elixir": [0.115, 0.880],
         "dark_elixir": [0.180, 0.880]
       },
-      "outside_tap_coordinate": [0.50, 0.50]
+      "outside_tap_coordinate": [0.50, 0.50],
+      "open_delay_sec": 0.85,
+      "close_delay_sec": 0.40
     }
   },
   "loot": {

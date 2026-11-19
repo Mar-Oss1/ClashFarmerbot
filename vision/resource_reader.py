@@ -26,15 +26,31 @@ class ResourceReader:
         self._bank: list[tuple[int, np.ndarray]] | None = None
         self._bank_by_scale: dict[float, list[tuple[int, np.ndarray]]] = {}
         self._preferred_scale: dict[str, float] = {}
+        self.last_tooltip_box: tuple[int, int, int, int] | None = None
 
-    @staticmethod
-    def _binarize_white_digits(gray_img: np.ndarray, adaptive: bool = False) -> np.ndarray:
+    @classmethod
+    def _binarize_digits(cls, img: np.ndarray, adaptive: bool = False) -> np.ndarray:
+        if img.ndim == 3:
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+            white_mask = (hsv[:, :, 1] <= 65) & (hsv[:, :, 2] >= 185)
+            yellow_mask = (
+                (hsv[:, :, 0] >= 14)
+                & (hsv[:, :, 0] <= 40)
+                & (hsv[:, :, 1] >= 75)
+                & (hsv[:, :, 2] >= 185)
+            )
+            return np.where(white_mask | yellow_mask, 255, 0).astype(np.uint8)
+
+        # Si ya es escala de grises (2D)
         thr = 190
-        if adaptive and gray_img.size > 0:
-            peak = float(np.percentile(gray_img, 99))
+        if adaptive and img.size > 0:
+            peak = float(np.percentile(img, 99))
             thr = int(np.clip(peak * 0.85, 150, 200))
-        _, binary = cv2.threshold(gray_img, thr, 255, cv2.THRESH_BINARY)
+        _, binary = cv2.threshold(img, thr, 255, cv2.THRESH_BINARY)
         return binary
+
+    # Alias para compatibilidad con código y tests previos
+    _binarize_white_digits = _binarize_digits
 
     @classmethod
     def _prepare_scaled_template(cls, tpl_gray: np.ndarray, scale: float) -> np.ndarray | None:
@@ -108,6 +124,27 @@ class ResourceReader:
         return sorted(kept, key=lambda k: k[0])
 
     @staticmethod
+    def _truncate_trailing_detections(
+        dets: list[tuple[int, int, int, float]],
+    ) -> list[tuple[int, int, int, float]]:
+        """
+        Descarta dígitos espurios a la derecha (e.g. el '2' de '2x' tras el icono de pastelito)
+        si hay un hueco horizontal > 1.8 * med_w entre dígitos consecutivos.
+        dets está ordenado por coordenada x: (x, digit, tw, score).
+        """
+        if len(dets) <= 1:
+            return dets
+        med_w = float(np.median([d[2] for d in dets]))
+        cutoff = 1.8 * med_w
+        truncated = [dets[0]]
+        for a, b in zip(dets, dets[1:]):
+            gap = b[0] - (a[0] + a[2])
+            if gap > cutoff:
+                break
+            truncated.append(b)
+        return truncated
+
+    @staticmethod
     def _valid_grouping(dets: list[tuple[int, int, int, float]]) -> bool:
         """Valida que todos los grupos de miles salvo el primero tengan exactamente 3 dígitos."""
         if not dets:
@@ -126,11 +163,11 @@ class ResourceReader:
                 groups[-1] += 1
         return 1 <= groups[0] <= 3 and all(g == 3 for g in groups[1:])
 
-    def _dump_fail(self, roi_gray: np.ndarray, roi_bin: np.ndarray, key: str):
+    def _dump_fail(self, roi_img: np.ndarray, roi_bin: np.ndarray, key: str):
         fail_dir = os.path.join(PROJECT_ROOT, "logs", "fails")
         os.makedirs(fail_dir, exist_ok=True)
         ts = int(time.time() * 1000)
-        save_debug_image_async(os.path.join(fail_dir, f"{ts}_{key}_gray.png"), roi_gray)
+        save_debug_image_async(os.path.join(fail_dir, f"{ts}_{key}_raw.png"), roi_img)
         save_debug_image_async(os.path.join(fail_dir, f"{ts}_{key}_bin.png"), roi_bin)
 
         # Rotación simple: no superar 200 archivos en logs/fails/
@@ -150,8 +187,8 @@ class ResourceReader:
         except Exception as e_rot:
             log.debug("Error en rotación de logs/fails/: %s", e_rot)
 
-    def _read_number_from_roi(self, roi_gray: np.ndarray, key: str = "") -> int | None:
-        roi_bin = self._binarize_white_digits(roi_gray, adaptive=True)
+    def _read_number_from_roi(self, roi_img: np.ndarray, key: str = "") -> int | None:
+        roi_bin = self._binarize_digits(roi_img, adaptive=True)
         roi_bin = cv2.copyMakeBorder(roi_bin, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=0)
 
         cat = "general"
@@ -167,13 +204,14 @@ class ResourceReader:
         if pref_scale is not None:
             cands_pref = self._candidates(roi_bin, floor=0.74, bank=self._get_bank_for_scale(pref_scale))
             dets_pref = self._nms(cands_pref, thr=0.74)
+            dets_pref = self._truncate_trailing_detections(dets_pref)
             if self._valid_grouping(dets_pref):
                 return int("".join(str(d[1]) for d in dets_pref))
 
         # 2. Fallback: probar todas las escalas y registrar la escala ganadora
         best_scale = None
         best_val = None
-        best_score = -1.0
+        best_metric = (-1, -1.0)
 
         for s in SCALES:
             cands_s = self._candidates(roi_bin, floor=0.65, bank=self._get_bank_for_scale(s))
@@ -181,10 +219,12 @@ class ResourceReader:
                 continue
             for thr in (0.80, 0.74, 0.68, 0.65):
                 dets_s = self._nms(cands_s, thr)
+                dets_s = self._truncate_trailing_detections(dets_s)
                 if self._valid_grouping(dets_s):
                     avg_score = float(np.mean([d[3] for d in dets_s]))
-                    if avg_score > best_score:
-                        best_score = avg_score
+                    metric = (len(dets_s), avg_score)
+                    if metric > best_metric:
+                        best_metric = metric
                         best_scale = s
                         best_val = int("".join(str(d[1]) for d in dets_s))
                     break
@@ -196,22 +236,37 @@ class ResourceReader:
 
         # 3. Fallback global sobre el banco combinado por si se requieren templates múltiples
         cands_global = self._candidates(roi_bin, floor=0.65)
+        best_global_metric = (-1, -1.0)
+        best_global_val = None
         for thr in (0.80, 0.74, 0.68, 0.65):
             dets = self._nms(cands_global, thr)
+            dets = self._truncate_trailing_detections(dets)
             if self._valid_grouping(dets):
-                return int("".join(str(d[1]) for d in dets))
+                avg_score = float(np.mean([d[3] for d in dets]))
+                metric = (len(dets), avg_score)
+                if metric > best_global_metric:
+                    best_global_metric = metric
+                    best_global_val = int("".join(str(d[1]) for d in dets))
+        if best_global_val is not None:
+            return best_global_val
 
-        self._dump_fail(roi_gray, roi_bin, key)
+        self._dump_fail(roi_img, roi_bin, key)
         return None
 
     def _extract_rois(self, screenshot, roi_map: dict, category: str = "") -> dict[str, int | None]:
-        if isinstance(screenshot, np.ndarray) and screenshot.ndim == 3:
-            screen_gray = np.min(screenshot[:, :, :3], axis=2)
+        if isinstance(screenshot, np.ndarray) and screenshot.ndim in (2, 3):
+            img = screenshot
         else:
-            screen_gray = self.vision.to_gray(screenshot)
+            img = self.vision.to_gray(screenshot)
 
-        h, w = screen_gray.shape[:2]
+        h, w = img.shape[:2]
         result: dict[str, int | None] = {}
+
+        for key, (ry1, ry2, rx1, rx2) in roi_map.items():
+            roi = img[int(h * ry1):int(h * ry2), int(w * rx1):int(w * rx2)]
+            composite_key = f"{category}_{key}" if category else key
+            result[key] = self._read_number_from_roi(roi, composite_key)
+        return result
 
         for key, (ry1, ry2, rx1, rx2) in roi_map.items():
             roi = screen_gray[int(h * ry1):int(h * ry2), int(w * rx1):int(w * rx2)]
@@ -315,20 +370,32 @@ class ResourceReader:
             digits = "".join(ch for ch in val if ch.isdigit())
             return int(digits) if digits else None
 
-        # 1. Total Capacity / Storage Capacity / Max:
-        m_cap = re.search(r"(?:Max(?:imum)?|Total|Storage)\s*(?:Capacity)?[^\d\n]*[:\-]?\s*([0-9][0-9\s,.]*)", text, re.IGNORECASE)
+        # 1. Total Capacity / Storage Capacity / Max / Capacidad máx.
+        m_cap = re.search(
+            r"(?:Max(?:imum)?|Total|Storage|Capacidad(?:\s*m[aá]x(?:ima)?|\s*total)?)\s*(?:Capacity)?[^\d\n]*[:\-]?\s*([0-9][0-9\s,.]*)",
+            text,
+            re.IGNORECASE,
+        )
         if not m_cap:
-            m_cap = re.search(r"Capacity[^\d\n]*[:\-]?\s*([0-9][0-9\s,.]*)", text, re.IGNORECASE)
+            m_cap = re.search(r"(?:Capacity|Capacidad)[^\d\n]*[:\-]?\s*([0-9][0-9\s,.]*)", text, re.IGNORECASE)
         if m_cap:
             result["total_capacity"] = _clean_number(m_cap.group(1))
 
-        # 2. Production per hour
-        m_prod = re.search(r"Production\s*(?:per\s*hour)?[^\d\n]*[:\-]?\s*([0-9][0-9\s,.]*)", text, re.IGNORECASE)
+        # 2. Production per hour / Producción por hora
+        m_prod = re.search(
+            r"(?:Production|Producci[oó]n)\s*(?:per\s*hour|por\s*hora)?[^\d\n]*[:\-]?\s*([0-9][0-9\s,.]*)",
+            text,
+            re.IGNORECASE,
+        )
         if m_prod:
             result["production_per_hour"] = _clean_number(m_prod.group(1))
 
-        # 3. In Treasury
-        m_tres = re.search(r"(?:In\s*)?Treasury[^\d\n]*[:\-]?\s*([0-9][0-9\s,.]*)", text, re.IGNORECASE)
+        # 3. In Treasury / En tesorería / Tesoro
+        m_tres = re.search(
+            r"(?:(?:In\s*)?Treasury|En\s*(?:la\s*)?tesorer[ií]a|Tesorer[ií]a|Tesoro)[^\d\n]*[:\-]?\s*([0-9][0-9\s,.]*)",
+            text,
+            re.IGNORECASE,
+        )
         if m_tres:
             result["in_treasury"] = _clean_number(m_tres.group(1))
 
@@ -378,6 +445,79 @@ class ResourceReader:
             return int(rx * width), int(ry * height)
         return int(width * 0.50), int(height * 0.50)
 
+    def find_tooltip_box(
+        self,
+        screenshot: np.ndarray,
+        roi: tuple[int, int, int, int] | None = None,
+    ) -> tuple[int, int, int, int] | None:
+        """
+        Detecta y retorna la caja delimitadora (x_left, y_top, bw, bh) del modal de tooltip en pantalla.
+        Retorna None si no se detecta con suficiente certeza.
+        """
+        if screenshot is None or getattr(screenshot, "size", 0) == 0:
+            return None
+
+        screen_gray = screenshot if screenshot.ndim == 2 else cv2.cvtColor(screenshot, cv2.COLOR_BGR2GRAY)
+        h, w = screen_gray.shape[:2]
+
+        if roi is not None:
+            y1, y2, x1, x2 = roi
+            return (x1, y1, x2 - x1, y2 - y1)
+
+        if w >= 1000:
+            sub = screen_gray[50:int(h * 0.45), int(w * 0.65):w]
+            ox, oy = int(w * 0.65), 50
+        else:
+            sub = screen_gray
+            ox, oy = 0, 0
+
+        # 1. Búsqueda principal por contornos rectangulares Canny
+        edges = cv2.Canny(sub, 40, 120)
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        canny_candidates = []
+        for c in contours:
+            cx, cy, cbw, cbh = cv2.boundingRect(c)
+            if 300 <= cbw <= 680 and 110 <= cbh <= 220 and 2.0 <= (cbw / cbh) <= 4.5:
+                canny_candidates.append((ox + cx, oy + cy, cbw, cbh))
+        if canny_candidates:
+            canny_candidates.sort(key=lambda b: abs((b[2] / b[3]) - 2.8))
+            return canny_candidates[0]
+
+        # 2. Respaldo por morfología de líneas horizontales paralelas del tooltip
+        _, bin_sub = cv2.threshold(sub, 170, 255, cv2.THRESH_BINARY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (80, 1))
+        lines = cv2.morphologyEx(bin_sub, cv2.MORPH_OPEN, kernel)
+        row_sums = np.sum(lines, axis=1) / 255
+        y_lines = np.where(row_sums > 140)[0]
+
+        groups = []
+        for y in y_lines:
+            if not groups or y > groups[-1][-1] + 5:
+                groups.append([y])
+            else:
+                groups[-1].append(y)
+
+        line_info = []
+        for g in groups:
+            mid_y = int(np.mean(g))
+            xs = np.where(lines[mid_y, :] > 0)[0]
+            if len(xs) > 0:
+                line_info.append((oy + mid_y, ox + xs[0], ox + xs[-1]))
+
+        if len(line_info) >= 2:
+            for i in range(len(line_info) - 1):
+                y_top, x_l1, x_r1 = line_info[i]
+                y_bot, x_l2, x_r2 = line_info[i + 1]
+                dh = y_bot - y_top
+                if 130 <= dh <= 170:
+                    x_left = min(x_l1, x_l2)
+                    x_right = max(x_r1, x_r2)
+                    bw = x_right - x_left
+                    if 350 <= bw <= 650:
+                        return (x_left, y_top, bw, dh)
+
+        return None
+
     def _extract_tooltip_cv(
         self,
         screenshot: np.ndarray,
@@ -401,12 +541,11 @@ class ResourceReader:
         screen_gray = screenshot if screenshot.ndim == 2 else cv2.cvtColor(screenshot, cv2.COLOR_BGR2GRAY)
         h, w = screen_gray.shape[:2]
 
-        box = None
+        boxes_to_try = []
         if roi is not None:
             y1, y2, x1, x2 = roi
-            box = (x1, y1, x2 - x1, y2 - y1)
+            boxes_to_try.append((x1, y1, x2 - x1, y2 - y1))
         else:
-            # 1. Búsqueda principal por morfología de líneas horizontales paralelas del tooltip
             if w >= 1000:
                 sub = screen_gray[50:int(h * 0.45), int(w * 0.65):w]
                 ox, oy = int(w * 0.65), 50
@@ -414,11 +553,24 @@ class ResourceReader:
                 sub = screen_gray
                 ox, oy = 0, 0
 
+            # 1. Búsqueda principal por contornos rectangulares Canny (detecta el contorno exterior completo del popup)
+            edges = cv2.Canny(sub, 40, 120)
+            contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+            canny_candidates = []
+            for c in contours:
+                cx, cy, cbw, cbh = cv2.boundingRect(c)
+                if 300 <= cbw <= 680 and 110 <= cbh <= 220 and 2.0 <= (cbw / cbh) <= 4.5:
+                    canny_candidates.append((ox + cx, oy + cy, cbw, cbh))
+            if canny_candidates:
+                canny_candidates.sort(key=lambda b: abs((b[2] / b[3]) - 2.8))
+                boxes_to_try.extend(canny_candidates[:3])
+
+            # 2. Respaldo por morfología de líneas horizontales paralelas del tooltip
             _, bin_sub = cv2.threshold(sub, 170, 255, cv2.THRESH_BINARY)
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (80, 1))
             lines = cv2.morphologyEx(bin_sub, cv2.MORPH_OPEN, kernel)
             row_sums = np.sum(lines, axis=1) / 255
-            y_lines = np.where(row_sums > 200)[0]
+            y_lines = np.where(row_sums > 140)[0]
 
             groups = []
             for y in y_lines:
@@ -438,49 +590,48 @@ class ResourceReader:
                 for i in range(len(line_info) - 1):
                     y_top, x_l1, x_r1 = line_info[i]
                     y_bot, x_l2, x_r2 = line_info[i + 1]
-                    if 130 <= (y_bot - y_top) <= 165:
+                    dh = y_bot - y_top
+                    if 130 <= dh <= 170:
                         x_left = min(x_l1, x_l2)
                         x_right = max(x_r1, x_r2)
                         bw = x_right - x_left
-                        bh = y_bot - y_top
                         if 350 <= bw <= 650:
-                            box = (x_left, y_top, bw, bh)
+                            boxes_to_try.append((x_left, y_top, bw, dh))
                             break
 
-            # 2. Respaldo por contornos rectangulares Canny si la línea morfométrica no fue suficiente
-            if box is None:
-                search_area = sub
-                edges = cv2.Canny(search_area, 40, 120)
-                contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-                candidates = []
-                for c in contours:
-                    cx, cy, cbw, cbh = cv2.boundingRect(c)
-                    if 320 <= cbw <= 650 and 110 <= cbh <= 200 and 2.2 <= (cbw / cbh) <= 4.5:
-                        candidates.append((ox + cx, oy + cy, cbw, cbh))
-                if candidates:
-                    candidates.sort(key=lambda b: abs((b[2] / b[3]) - 3.2))
-                    box = candidates[0]
-
-        # Si no se detectó ningún tooltip abierto, retornar inmediatamente vacío (NO usar cajas fijas inventadas)
-        if box is None:
+        if not boxes_to_try:
             return result
 
-        x_left, y_top, bw, bh = box
-        # Slices precisos de las 3 filas numéricas dentro de la caja delimitada:
-        # Fila 1 (Max: <capacidad>)
-        r1 = screen_gray[y_top + int(bh * 0.08) : y_top + int(bh * 0.38), x_left + int(bw * 0.30) : x_left + bw - 10]
-        # Fila 2 (Production per hour: <producción>)
-        r2 = screen_gray[y_top + int(bh * 0.38) : y_top + int(bh * 0.68), x_left + int(bw * 0.42) : x_left + bw - 10]
-        # Fila 3 (In treasury: <tesorería>)
-        r3 = screen_gray[y_top + int(bh * 0.68) : y_top + int(bh * 0.98), x_left + int(bw * 0.30) : x_left + bw - 10]
+        best_result = None
+        best_box = None
+        for box in boxes_to_try:
+            x_left, y_top, bw, bh = box
+            # Slices precisos de las 3 filas numéricas dentro de la caja delimitada:
+            # Fila 1 (Max: <capacidad>)
+            r1 = screen_gray[y_top + int(bh * 0.08) : y_top + int(bh * 0.38), x_left + int(bw * 0.30) : x_left + bw - 10]
+            # Fila 2 (Production per hour: <producción>)
+            r2 = screen_gray[y_top + int(bh * 0.38) : y_top + int(bh * 0.68), x_left + int(bw * 0.40) : x_left + bw - 10]
+            # Fila 3 (In treasury: <tesorería>)
+            r3 = screen_gray[y_top + int(bh * 0.68) : y_top + int(bh * 0.98), x_left + int(bw * 0.30) : x_left + bw - 10]
 
-        if r1.size > 0:
-            result["total_capacity"] = self._read_number_from_roi(r1, "tooltip_max_cap")
-        if r2.size > 0:
-            result["production_per_hour"] = self._read_number_from_roi(r2, "tooltip_prod")
-        if r3.size > 0:
-            result["in_treasury"] = self._read_number_from_roi(r3, "tooltip_treasury")
+            cand = {"total_capacity": None, "production_per_hour": None, "in_treasury": None}
+            if r1.size > 0:
+                cand["total_capacity"] = self._read_number_from_roi(r1, "tooltip_max_cap")
+            if r2.size > 0:
+                cand["production_per_hour"] = self._read_number_from_roi(r2, "tooltip_prod")
+            if r3.size > 0:
+                cand["in_treasury"] = self._read_number_from_roi(r3, "tooltip_treasury")
 
+            if cand.get("total_capacity") is not None and cand["total_capacity"] >= 10000:
+                self.last_tooltip_box = box
+                return cand
+            if cand.get("total_capacity") is not None and best_result is None:
+                best_result = cand
+                best_box = box
+
+        if best_result is not None:
+            self.last_tooltip_box = best_box
+            return best_result
         return result
 
     def extract_tooltip_values_from_image(
@@ -511,7 +662,7 @@ class ResourceReader:
             y1, y2, x1, x2 = roi
             crop = screenshot[y1:y2, x1:x2]
         else:
-            crop = screenshot[0:int(h * 0.48), int(w * 0.45):w]
+            crop = screenshot[0:int(h * 0.40), int(w * 0.65):int(w * 0.98)]
 
         if crop.size == 0:
             return result
@@ -547,23 +698,38 @@ class ResourceReader:
         self,
         device,
         resource_type: str,
-        delay_sec: float = 0.6,
+        delay_sec: float | None = None,
     ) -> dict[str, int | None] | None:
         """
         Flujo de lectura interactivo:
         1. Toca la barra o icono del recurso para desplegar su tooltip informativo.
         2. Espera el renderizado del tooltip y toma captura de pantalla.
-        3. Toca NUEVAMENTE en la misma coordenada de la barra para cerrar el popup limpiamente (toggle).
+        3. Toca en el centro de la ventanita modal detectada (o fallback interior) para cerrar el popup limpiamente.
         4. Extrae y retorna los 3 valores (Total Capacity, Production per hour, In Treasury).
         """
+        tooltips_cfg = SETTINGS.get("rois", {}).get("resource_tooltips", {})
+        open_delay = delay_sec if delay_sec is not None else float(tooltips_cfg.get("open_delay_sec", 0.85))
+        close_delay = float(tooltips_cfg.get("close_delay_sec", 0.40))
+
         w, h = getattr(device, "width", 2400), getattr(device, "height", 1080)
         tap_pos = self.get_resource_icon_tap_pos(resource_type, width=w, height=h)
 
+        self.last_tooltip_box = None
         log.info("🔎 Abriendo tooltip de recurso %s tocando en %s...", resource_type.upper(), tap_pos)
         device.tap(tap_pos[0], tap_pos[1], humanize=False)
-        time.sleep(delay_sec)
+        time.sleep(open_delay)
 
         screen = device.screenshot()
+        values = self.extract_tooltip_values_from_image(screen)
+
+        # Si el primer frame no detectó el popup (animación lenta o lag de renderizado), ventana de gracia
+        if values.get("total_capacity") is None and getattr(device, "screenshot", None) is not None:
+            time.sleep(0.35)
+            screen_retry = device.screenshot()
+            values_retry = self.extract_tooltip_values_from_image(screen_retry)
+            if values_retry.get("total_capacity") is not None:
+                screen = screen_retry
+                values = values_retry
 
         # Guardar captura de depuración y auditoría para OCR y análisis de background
         try:
@@ -573,15 +739,22 @@ class ResourceReader:
         except Exception as e_save:
             log.debug("Error guardando captura de tooltip: %s", e_save)
 
-        # Cerrar el tooltip tocando nuevamente en la misma barra (toggle)
+        # Cerrar el tooltip tocando el centro del modal detectado (o fallback modal interior)
+        modal_box = getattr(self, "last_tooltip_box", None) or self.find_tooltip_box(screen)
+        if modal_box is not None:
+            bx, by, bw, bh = modal_box
+            close_pos = (int(bx + bw // 2), int(by + bh // 2))
+            log.info("🔒 Cerrando tooltip de %s tocando el centro del modal en %s...", resource_type.upper(), close_pos)
+        else:
+            close_pos = (int(tap_pos[0] - 150), int(tap_pos[1] + 110))
+            log.info("🔒 Cerrando tooltip de %s usando tap fallback modal en %s...", resource_type.upper(), close_pos)
+
         try:
-            log.info("🔒 Cerrando tooltip de %s tocando de nuevo en %s (toggle)...", resource_type.upper(), tap_pos)
-            device.tap(tap_pos[0], tap_pos[1], humanize=False)
-            time.sleep(0.4)
+            device.tap(close_pos[0], close_pos[1], humanize=False)
+            time.sleep(close_delay)
         except Exception as err:
             log.warning("⚠️ Error al cerrar tooltip de %s: %s", resource_type, err)
 
-        values = self.extract_tooltip_values_from_image(screen)
         if values.get("total_capacity") is not None:
             log.info(
                 "✅ Tooltip %s leído con éxito -> Capacidad: %s | Producción: %s | Treasury: %s",

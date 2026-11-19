@@ -122,6 +122,18 @@ class TestTooltipParsingAndReading(unittest.TestCase):
         self.assertEqual(parsed["production_per_hour"], 68_600)
         self.assertEqual(parsed["in_treasury"], 1_105_000)
 
+    def test_parse_tooltip_text_spanish_labels(self):
+        """Verifica la extracción precisa de los 3 valores desde texto en español."""
+        sample_text = """
+        Capacidad máx.: 21 000 000
+        Producción por hora: 68 600
+        En la tesorería: 1 105 000
+        """
+        parsed = self.reader.parse_tooltip_text(sample_text)
+        self.assertEqual(parsed["total_capacity"], 21_000_000)
+        self.assertEqual(parsed["production_per_hour"], 68_600)
+        self.assertEqual(parsed["in_treasury"], 1_105_000)
+
     def test_extract_tooltip_values_from_real_fixture(self):
         """Verifica que la visión por computador extraiga exactamente los 3 valores desde la captura real."""
         import cv2
@@ -151,6 +163,25 @@ class TestTooltipParsingAndReading(unittest.TestCase):
         self.assertEqual(extracted_full["production_per_hour"], 68_600)
         self.assertEqual(extracted_full["in_treasury"], 1_105_000)
 
+    def test_extract_tooltip_values_from_real_full_screen_gold_fixture(self):
+        """Verifica la detección y lectura CV desde una captura de pantalla completa real (2400x1080) con el tooltip de oro abierto."""
+        import cv2
+        import os
+        from core.vision import Vision
+        fixture_path = os.path.join(PROJECT_ROOT, "tests", "fixtures", "sample_gold_tooltip_full.png")
+        if not os.path.exists(fixture_path):
+            self.skipTest("Fixture sample_gold_tooltip_full.png no encontrada en tests/fixtures")
+
+        img = cv2.imread(fixture_path)
+        self.assertIsNotNone(img)
+        self.assertEqual(img.shape[:2], (1080, 2400))
+
+        real_reader = ResourceReader(Vision())
+        extracted = real_reader.extract_tooltip_values_from_image(img)
+        self.assertEqual(extracted["total_capacity"], 21_000_000)
+        self.assertEqual(extracted["production_per_hour"], 34_300)
+        self.assertEqual(extracted["in_treasury"], 0)
+
     def test_read_all_resource_tooltips_flow_and_clean_taps(self):
         """Verifica que read_all_resource_tooltips lea secuencialmente los 3 recursos."""
         mock_device = MagicMock()
@@ -167,7 +198,7 @@ class TestTooltipParsingAndReading(unittest.TestCase):
         self.assertEqual(mock_read.call_count, 3)
 
     def test_read_resource_tooltip_flow_and_close(self):
-        """Verifica que se toque el icono para abrir, se capture screenshot y se vuelva a tocar para cerrar (toggle)."""
+        """Verifica que se toque el icono para abrir, se capture screenshot y se cierre tocando el centro del modal detectado."""
         mock_device = MagicMock()
         mock_device.width = 2400
         mock_device.height = 1080
@@ -179,7 +210,11 @@ class TestTooltipParsingAndReading(unittest.TestCase):
             "in_treasury": 5_000_000,
         }
 
-        with patch.object(self.reader, "extract_tooltip_values_from_image", return_value=sample_parsed):
+        def fake_extract(screen, roi=None):
+            self.reader.last_tooltip_box = (1705, 63, 522, 198)
+            return sample_parsed
+
+        with patch.object(self.reader, "extract_tooltip_values_from_image", side_effect=fake_extract):
             result = self.reader.read_resource_tooltip(mock_device, "gold", delay_sec=0.01)
 
         self.assertIsNotNone(result)
@@ -187,13 +222,42 @@ class TestTooltipParsingAndReading(unittest.TestCase):
         self.assertEqual(result["production_per_hour"], 84_000)
         self.assertEqual(result["in_treasury"], 5_000_000)
 
-        # Verificar que device.tap fue llamado al menos 2 veces: abrir icono y cerrar tocando de nuevo
+        # Verificar que device.tap fue llamado exactamente 2 veces
         self.assertEqual(mock_device.tap.call_count, 2)
-        # Ambos toques deben ser a la coordenada de la barra de oro (2112, 54) para abrir y cerrar
+        first_call = mock_device.tap.call_args_list[0]
+        second_call = mock_device.tap.call_args_list[1]
+        # Primer tap abre la barra de oro en (2112, 54)
+        self.assertEqual(first_call[0], (2112, 54))
+        # Segundo tap cierra en el centro del modal detectado: (1705 + 261, 63 + 99) = (1966, 162)
+        self.assertEqual(second_call[0], (1966, 162))
+        self.assertNotEqual(second_call[0], first_call[0], "El segundo tap no debe ser toggle sobre la barra")
+
+    def test_read_resource_tooltip_fallback_close_when_no_box(self):
+        """Verifica que si no se detecta la caja del modal, el cierre use el tap fallback desplazado y no tap_pos."""
+        mock_device = MagicMock()
+        mock_device.width = 2400
+        mock_device.height = 1080
+        mock_device.screenshot.return_value = np.zeros((1080, 2400, 3), dtype=np.uint8)
+
+        sample_parsed = {
+            "total_capacity": 24_000_000,
+            "production_per_hour": 84_000,
+            "in_treasury": 5_000_000,
+        }
+
+        with patch.object(self.reader, "extract_tooltip_values_from_image", return_value=sample_parsed), \
+             patch.object(self.reader, "find_tooltip_box", return_value=None):
+            self.reader.last_tooltip_box = None
+            result = self.reader.read_resource_tooltip(mock_device, "gold", delay_sec=0.01)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(mock_device.tap.call_count, 2)
         first_call = mock_device.tap.call_args_list[0]
         second_call = mock_device.tap.call_args_list[1]
         self.assertEqual(first_call[0], (2112, 54))
-        self.assertEqual(second_call[0], (2112, 54))
+        # Fallback desplazado a la izquierda/abajo: (2112 - 150, 54 + 110) = (1962, 164)
+        self.assertEqual(second_call[0], (1962, 164))
+        self.assertNotEqual(second_call[0], first_call[0], "El tap fallback no debe caer sobre la barra")
 
 
 class TestLedgerCapacityAndTrigger(unittest.TestCase):

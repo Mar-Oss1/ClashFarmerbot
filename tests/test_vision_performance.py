@@ -155,6 +155,72 @@ class TestVisionPerformance(unittest.TestCase):
         self.assertEqual(loot1, loot2)
         self.assertLessEqual(t_second, t_first * 1.5, "La lectura con escala preferida debe ser rápida")
 
+    def test_05_read_enemy_loot_2x_cake_real_fixture(self):
+        """
+        Verifica que read_enemy_loot lea con precisión botín con dígitos amarillos/dorados
+        y descarte el pastelito y sufijo '2x' del evento 2x Cake desde la captura real.
+        """
+        fixture_path = os.path.join(PROJECT_ROOT, "tests", "fixtures", "sample_loot_2x_cake.jpg")
+        if not os.path.exists(fixture_path):
+            self.skipTest(f"Fixture no encontrado: {fixture_path}")
+
+        img = cv2.imread(fixture_path)
+        self.assertIsNotNone(img, "No se pudo cargar la imagen del fixture 2x cake")
+
+        v = Vision()
+        reader = ResourceReader(v)
+        loot = reader.read_enemy_loot(img)
+
+        self.assertEqual(loot.get("gold"), 814164, "Oro con boost 2x debe ser 814,164")
+        self.assertEqual(loot.get("elixir"), 446658, "Elixir con boost 2x debe ser 446,658")
+        self.assertEqual(loot.get("dark_elixir"), 10914, "Elixir Oscuro con boost 2x debe ser 10,914")
+
+    def test_06_read_enemy_loot_yellow_digits_and_cake_synthetic(self):
+        """
+        Test sintético offline: genera números amarillos con sufijo '2x' y separador amplio (>1.8*med_w)
+        para validar que la binarización HSV y el truncado descarten el '2' espurio sin dependencias externas.
+        """
+        v = Vision()
+        reader = ResourceReader(v)
+        screen = np.zeros((1080, 2400, 3), dtype=np.uint8)
+        yellow_bgr = (30, 220, 255)  # Color amarillo brillante en BGR
+
+        def paste_number(canvas, roi_box, num_str, suffix="2"):
+            ry1, ry2, rx1, rx2 = roi_box
+            y1, y2, x1, x2 = int(ry1 * 1080), int(ry2 * 1080), int(rx1 * 2400), int(rx2 * 2400)
+            cur_x = x1 + 10
+            cur_y = y1 + 10
+            for ch in num_str:
+                if ch == " ":
+                    cur_x += 8  # Espacio separador de miles en CoC (~8px)
+                    continue
+                tpl_gray, _ = v._load_template(f"assets/digits/{ch}.png")
+                th, tw = tpl_gray.shape[:2]
+                bin_tpl = reader._binarize_digits(tpl_gray)
+                digit_bgr = np.zeros((th, tw, 3), dtype=np.uint8)
+                digit_bgr[bin_tpl > 0] = yellow_bgr
+                canvas[cur_y:cur_y + th, cur_x:cur_x + tw] = digit_bgr
+                cur_x += tw + 1
+            # Hueco del pastelito (> 1.8 * med_w, e.g. 50px)
+            cur_x += 50
+            for ch in suffix:
+                tpl_gray, _ = v._load_template(f"assets/digits/{ch}.png")
+                th, tw = tpl_gray.shape[:2]
+                bin_tpl = reader._binarize_digits(tpl_gray)
+                digit_bgr = np.zeros((th, tw, 3), dtype=np.uint8)
+                digit_bgr[bin_tpl > 0] = yellow_bgr
+                canvas[cur_y:cur_y + th, cur_x:cur_x + tw] = digit_bgr
+                cur_x += tw + 1
+
+        paste_number(screen, reader.enemy_rois["gold"], "814 164")
+        paste_number(screen, reader.enemy_rois["elixir"], "446 658")
+        paste_number(screen, reader.enemy_rois["dark_elixir"], "10 914")
+
+        loot = reader.read_enemy_loot(screen)
+        self.assertEqual(loot.get("gold"), 814164)
+        self.assertEqual(loot.get("elixir"), 446658)
+        self.assertEqual(loot.get("dark_elixir"), 10914)
+
 
 if __name__ == "__main__":
     unittest.main()
