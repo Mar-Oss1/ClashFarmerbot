@@ -83,8 +83,13 @@
       "conf_thresh": 0.5,
       "use_tta": false
     },
-    "jump_placement": "wall_raycast",
+    "jump_placement": "compartments",
     "wall_detection_mode": "unet",
+    "wall_seg": {
+      "morph_closing_enabled": true,
+      "morph_kernel_length": 19,
+      "morph_angles": [36.0, 144.0]
+    },
     "adaptive_spells_by_demand": true,
     "allow_surrender": true,
     "early_surrender_on_zero_loot": true,
@@ -122,7 +127,7 @@
     },
     "jump_optimizer": {
       "wall_detection_mode": "unet",
-      "buildings_block": true,
+      "buildings_block": false,
       "wall_thickness": 8,
       "endpoint_tol": 25.0,
       "morph_kernel_size": 5,
@@ -132,14 +137,16 @@
       "use_wall_seg": true,
       "wall_seg_model_path": "models/wall_seg.onnx",
       "wall_seg_conf": 0.3,
-      "rx": 76.0,
-      "ry": 57.0,
-      "effective_radius": 72.0,
+      "rx": 66.0,
+      "ry": 60.0,
+      "effective_radius": 63.0,
       "min_wall_pixels": 30,
       "core_radius": 42.0,
       "beam_width": 4,
       "max_jumps": 4,
-      "min_sep_px": 95.0
+      "min_sep_px": 95.0,
+      "distance_penalty_factor": 0.0005,
+      "target_dist_weight": 1.1
     },
     "zone_attack_flanks": [
       "north",

@@ -23,3 +23,19 @@ models/
 datasets/
 *.onnx
 *.pt
+
+
+# Reglas agregadas automáticamente por safe_purge.py
+# Cuarentena y archivos temporales pesados
+_quarantine/
+_trash*/
+_backups*/
+*.h264
+*.mkv
+*.mp4
+*_context.md
+muros_context.md
+muros_only.md
+
+# Bundle temporal para entrenamiento en Google Colab
+colab_bundle/

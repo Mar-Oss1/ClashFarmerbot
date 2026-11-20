@@ -18,12 +18,10 @@ from core.vision import Vision, save_debug_image_async
 from vision.army_checker import ArmyChecker, BattleBarSlots
 from vision.storage_detector import StorageDetector
 from vision.yolo_detector import Detection, get_detector
-from vision.wall_raycast import (
-    estimate_iso_angles,
-    detect_global_wall_segments,
-    find_wall_crossings_from_segments,
+from attack import jump_planner
+from attack.jump_planner import (
     find_wall_crossings,
-    draw_wall_raycast_debug,
+    plan_flank_jump_crossings,
 )
 from humanizer.behavior import HumanBehavior
 from core.logger import get_logger
@@ -968,7 +966,12 @@ class DeploymentStrategy:
                     storages.append((cx, cy))
         return storages
 
-    def _deploy_strategic_spells_centered(self, screen=None, precomputed_detections: list[Detection] | None = None):
+    def _deploy_strategic_spells_centered(
+        self,
+        screen=None,
+        precomputed_detections: list[Detection] | None = None,
+        drop_points: list[tuple[int, int]] | None = None,
+    ):
         """
         Despliega estratégicamente los Hechizos de Salto con la cámara
         completamente centrada y con zoom-out (inmediatamente después de zoom_out base).
@@ -1012,8 +1015,17 @@ class DeploymentStrategy:
                         avg_conf, min_skip_conf
                     )
 
+                if drop_points is None and detections:
+                    from attack.jump_planner import compute_canonical_diamond_drop
+                    loot_targets = [
+                        d for d in detections
+                        if getattr(d, "cls_name", "").startswith("storage") or getattr(d, "cls_name", "") == "town_hall"
+                    ]
+                    if loot_targets:
+                        drop_points = [compute_canonical_diamond_drop(d.center) for d in loot_targets]
+
                 jump_targets = compute_adaptive_jump_targets_from_detections(
-                    detections, (s.shape[1], s.shape[0]), screen=s
+                    detections, (s.shape[1], s.shape[0]), screen=s, drop_points=drop_points
                 )
                 # Guardar imagen anotada en logs/yolo/ para análisis de fallos y reentrenamiento
                 try:
@@ -1805,7 +1817,11 @@ class DeploymentStrategy:
             crossings = []
             if isinstance(screen, np.ndarray) and screen.size > 0:
                 try:
-                    crossings = find_wall_crossings(screen, (drop_x, drop_y), (tx, ty))
+                    # Usar jump_planner en lugar de llamar directo a vision.wall_raycast
+                    if find_wall_crossings is not getattr(jump_planner, "find_wall_crossings", None):
+                        crossings = find_wall_crossings(screen, (drop_x, drop_y), (tx, ty))
+                    else:
+                        crossings = jump_planner.plan_flank_jump_crossings(screen, (drop_x, drop_y), (tx, ty))
                 except Exception:
                     crossings = []
 
@@ -1977,7 +1993,12 @@ class DeploymentStrategy:
             storages = [d for d, _ in reachable_targets if "storage" in d.cls_name or d.cls_name == "town_hall"]
             if zone_name == "CENTRO":
                 if self._storages_are_interior_locked(storages, green_contour):
-                    self._deploy_strategic_spells_centered(screen, precomputed_detections=[d for d, _ in reachable_targets])
+                    centro_drop_points = [drop_pt for _, drop_pt in reachable_targets]
+                    self._deploy_strategic_spells_centered(
+                        screen,
+                        precomputed_detections=[d for d, _ in reachable_targets],
+                        drop_points=centro_drop_points,
+                    )
             else:
                 self._deploy_flank_spells(screen, zone_name, reachable_targets, green_contour, safe_y_min, safe_y_max)
 

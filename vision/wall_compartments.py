@@ -62,6 +62,8 @@ class JumpCandidate:
     cost_before: float
     cost_after: float
     bridged_compartments: list[int] = field(default_factory=list)
+    drop_dist: float = 0.0
+    travel_dist: float = 0.0
 
 
 @dataclass
@@ -766,7 +768,7 @@ def optimize_jumps(
     max_jumps: int = DEFAULT_MAX_JUMPS,
     min_marginal_gain: float = 0.5,
     loot_weights: dict[str, float] | None = None,
-    buildings_block: bool = True,
+    buildings_block: bool | None = None,
     wall_thickness: int = 8,
     endpoint_tol: float = 25.0,
     morph_kernel_size: int = 5,
@@ -785,6 +787,9 @@ def optimize_jumps(
     min_wall_pixels: int | None = None,
     core_radius: float = DEFAULT_CORE_RADIUS,
     wall_detection_mode: str | None = None,
+    deploy_zone_mask: np.ndarray | None = None,
+    distance_penalty_factor: float | None = None,
+    target_dist_weight: float | None = None,
 ) -> CompartmentAnalysisResult:
     """
     Función maestra de optimización de saltos por modelo de compartimentos.
@@ -794,6 +799,8 @@ def optimize_jumps(
     3. Filtro de densidad de muro (is_valid_wall_centered_jump con core_radius=42 px, min_wall_pixels=30).
     4. Beam Search con anticipación (beam_width=4, min_sep_px=95.0 px) para encadenar
        saltos intermedios de ganancia 0.0 hacia el núcleo.
+    5. Penalización suave por distancia al despliegue (drop_points o borde de deploy_zone_mask)
+       para preferir siempre muros exteriores ante candidatos con igual ganancia.
     Presupuesto de ejecución: < 300 ms por aldea.
     """
     t_start = time.perf_counter()
@@ -810,6 +817,43 @@ def optimize_jumps(
     beam_width = int(cfg_opt.get("beam_width", beam_width))
     min_sep_px = float(cfg_opt.get("min_sep_px", min_sep_px))
     core_radius = float(cfg_opt.get("core_radius", core_radius))
+    if buildings_block is None:
+        if "buildings_block" in cfg_opt:
+            buildings_block = bool(cfg_opt["buildings_block"])
+        else:
+            buildings_block = True
+    if distance_penalty_factor is None:
+        distance_penalty_factor = float(cfg_opt.get("distance_penalty_factor", 0.0005))
+    if target_dist_weight is None:
+        target_dist_weight = float(cfg_opt.get("target_dist_weight", 1.1))
+
+    # Precomputar mapa de distancia euclidiana a la zona de despliegue si está disponible
+    if not drop_points and deploy_zone_mask is None and base_img is not None:
+        try:
+            from vision.deploy_zone_detector import get_deploy_zone_detector
+            dzd = get_deploy_zone_detector()
+            if dzd is not None and dzd.is_ready():
+                deploy_zone_mask = dzd.predict_mask(base_img)
+        except Exception as e:
+            log.debug("Auto deploy_zone_mask retrieval skipped en optimize_jumps: %s", e)
+
+    deploy_dist_map = None
+    if deploy_zone_mask is not None and isinstance(deploy_zone_mask, np.ndarray):
+        if deploy_zone_mask.shape[:2] != (h, w):
+            dz_native = cv2.resize(deploy_zone_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        else:
+            dz_native = deploy_zone_mask
+        # En deploy_zone_mask: 0 = exterior legal (césped), 1 = interior aldea
+        deploy_dist_map = cv2.distanceTransform((dz_native > 0).astype(np.uint8), cv2.DIST_L2, 3)
+
+    def _get_cand_drop_dist(cx_orig: int, cy_orig: int) -> float:
+        if drop_points:
+            return float(min(math.hypot(cx_orig - dp[0], cy_orig - dp[1]) for dp in drop_points))
+        if deploy_dist_map is not None:
+            c_y = min(h - 1, max(0, cy_orig))
+            c_x = min(w - 1, max(0, cx_orig))
+            return float(deploy_dist_map[c_y, c_x])
+        return 0.0
 
     # Escalamiento dinámico de min_wall_pixels si no se pasó explícitamente
     if min_wall_pixels is not None:
@@ -986,6 +1030,18 @@ def optimize_jumps(
     if num_comps <= 1 or not targets or (not wall_segments and wall_pixel_count == 0):
         initial_cost, _ = compute_total_cost(graph, entry_comps, targets, jump_bridges=[])
         t_elapsed = (time.perf_counter() - t_start) * 1000.0
+        debug_overlay = None
+        if generate_debug_overlay:
+            debug_overlay = render_debug_overlay(
+                base_img=base_img if base_img is not None else np.zeros((h, w, 3), dtype=np.uint8),
+                comp_labels=comp_labels,
+                wall_mask=scaled_wall_mask,
+                selected_jumps=[],
+                footprint=jump_footprint,
+                targets=targets,
+                edges=edges,
+                grid_scale=scale,
+            )
         return CompartmentAnalysisResult(
             jumps=[],
             jump_details=[],
@@ -998,7 +1054,7 @@ def optimize_jumps(
             edges=edges,
             target_assignments=targets,
             execution_time_ms=t_elapsed,
-            debug_overlay=None,
+            debug_overlay=debug_overlay,
             graph=graph,
             entry_comps=entry_comps,
             nearest_labels=nearest_labels,
@@ -1010,6 +1066,18 @@ def optimize_jumps(
 
     if (initial_cost <= 0.0 and not force_max_jumps) or max_jumps <= 0:
         t_elapsed = (time.perf_counter() - t_start) * 1000.0
+        debug_overlay = None
+        if generate_debug_overlay:
+            debug_overlay = render_debug_overlay(
+                base_img=base_img if base_img is not None else np.zeros((h, w, 3), dtype=np.uint8),
+                comp_labels=comp_labels,
+                wall_mask=scaled_wall_mask,
+                selected_jumps=[],
+                footprint=jump_footprint,
+                targets=targets,
+                edges=edges,
+                grid_scale=scale,
+            )
         return CompartmentAnalysisResult(
             jumps=[],
             jump_details=[],
@@ -1022,7 +1090,7 @@ def optimize_jumps(
             edges=edges,
             target_assignments=targets,
             execution_time_ms=t_elapsed,
-            debug_overlay=None,
+            debug_overlay=debug_overlay,
             graph=graph,
             entry_comps=entry_comps,
             nearest_labels=nearest_labels,
@@ -1051,14 +1119,15 @@ def optimize_jumps(
     if len(candidates) > max_candidates:
         candidates = candidates[:max_candidates]
 
+    t_search_start = time.perf_counter()
     loop_deadline = time_budget_sec - 0.030
 
     # Filtrar candidatos válidos:
     # A) Filtro de densidad de muro (is_valid_wall_centered_jump con core_radius=42, min_wall_pixels=30)
     # B) Cubre al menos 2 compartimentos libres en comp_labels/nearest_labels
-    raw_valid_candidates: list[tuple[tuple[int, int], set[int], int, int, int]] = []
+    raw_valid_candidates: list[tuple[tuple[int, int], set[int], int, int, int, float]] = []
     for cand in candidates:
-        if (time.perf_counter() - t_start) >= loop_deadline:
+        if (time.perf_counter() - t_search_start) >= loop_deadline:
             break
 
         cand_orig_x = int(round(cand[0] * scale))
@@ -1082,21 +1151,39 @@ def optimize_jumps(
             nearest_labels=nearest_labels,
         )
         if len(touched_comps) >= 2:
-            raw_valid_candidates.append((cand, touched_comps, wall_px, cand_orig_x, cand_orig_y))
+            cand_drop_dist = _get_cand_drop_dist(cand_orig_x, cand_orig_y)
+            cand_targets = [t for t in targets if t["comp"] in (touched_comps - entry_comps)]
+            if not cand_targets:
+                cand_targets = [t for t in targets if t["comp"] not in entry_comps]
+            if not cand_targets:
+                cand_targets = targets
+            if cand_targets:
+                cand_target_dist = min(
+                    math.hypot(cand_orig_x - t["center"][0] * scale, cand_orig_y - t["center"][1] * scale)
+                    for t in cand_targets
+                )
+            else:
+                cand_target_dist = 0.0
+            cand_travel_dist = cand_drop_dist + target_dist_weight * cand_target_dist
+            raw_valid_candidates.append(
+                (cand, touched_comps, wall_px, cand_orig_x, cand_orig_y, cand_travel_dist, cand_drop_dist)
+            )
 
     # Poda por equivalencia topológica:
     # Agrupar por comp_key = frozenset(touched_comps)
     candidates_by_comp: dict[frozenset[int], list] = defaultdict(list)
-    for cand, touched_comps, wall_px, cx_orig, cy_orig in raw_valid_candidates:
+    for cand, touched_comps, wall_px, cx_orig, cy_orig, cand_travel_dist, cand_drop_dist in raw_valid_candidates:
         comp_key = frozenset(touched_comps)
-        candidates_by_comp[comp_key].append((cand, touched_comps, wall_px, cx_orig, cy_orig))
+        candidates_by_comp[comp_key].append(
+            (cand, touched_comps, wall_px, cx_orig, cy_orig, cand_travel_dist, cand_drop_dist)
+        )
 
-    valid_candidates: list[tuple[tuple[int, int], set[int]]] = []
+    valid_candidates: list[tuple[tuple[int, int], set[int], float, float]] = []
     for comp_key, c_list in candidates_by_comp.items():
-        # Prioridad 1: mayor densidad de muro en el núcleo
-        c_list.sort(key=lambda item: item[2], reverse=True)
+        # Prioridad: 1) densidad de muro suficiente, 2) menor recorrido total, 3) mayor densidad de muro
+        c_list.sort(key=lambda item: (item[2] >= min_wall_pixels, -item[5], item[2]), reverse=True)
         best = c_list[0]
-        valid_candidates.append((best[0], best[1]))
+        valid_candidates.append((best[0], best[1], best[5], best[6]))
 
         # Conservar hasta 2 representantes solo si están separados más de min_sep_px del primero
         if len(c_list) > 1:
@@ -1104,7 +1191,7 @@ def optimize_jumps(
             for second in c_list[1:]:
                 sec_x_orig, sec_y_orig = second[3], second[4]
                 if math.hypot(sec_x_orig - best_x_orig, sec_y_orig - best_y_orig) >= min_sep_px:
-                    valid_candidates.append((second[0], second[1]))
+                    valid_candidates.append((second[0], second[1], second[5], second[6]))
                     break
 
     log.debug(
@@ -1124,6 +1211,7 @@ def optimize_jumps(
         total_gain: float
         dists: dict[int, float]
         sum_target_dists: float
+        total_travel_dist: float = 0.0
 
     initial_target_dists = sum(initial_dist.get(t["comp"], 10.0) * t["weight"] for t in targets)
     root_state = BeamState(
@@ -1133,6 +1221,7 @@ def optimize_jumps(
         total_gain=0.0,
         dists=initial_dist,
         sum_target_dists=initial_target_dists,
+        total_travel_dist=0.0,
     )
 
     current_beam: list[BeamState] = [root_state]
@@ -1141,22 +1230,22 @@ def optimize_jumps(
     total_states_evaluated = 0
 
     for depth in range(max_jumps):
-        if (time.perf_counter() - t_start) >= loop_deadline:
-            log.warning("⏳ Presupuesto de tiempo excedido en Beam Search nivel %d (%.1f ms)", depth, (time.perf_counter() - t_start) * 1000.0)
+        if (time.perf_counter() - t_search_start) >= loop_deadline:
+            log.warning("⏳ Presupuesto de tiempo excedido en Beam Search nivel %d (%.1f ms)", depth, (time.perf_counter() - t_search_start) * 1000.0)
             break
 
         next_expansions: list[BeamState] = []
 
         for state in current_beam:
-            if (time.perf_counter() - t_start) >= loop_deadline:
+            if (time.perf_counter() - t_search_start) >= loop_deadline:
                 break
 
             # Si ya se alcanzó costo 0 y no se fuerzan saltos máximos, no es necesario expandir esta rama
             if not force_max_jumps and state.cost <= 0.0:
                 continue
 
-            for cand, touched_comps in valid_candidates:
-                if (time.perf_counter() - t_start) >= loop_deadline:
+            for cand, touched_comps, cand_travel_dist, cand_drop_dist in valid_candidates:
+                if (time.perf_counter() - t_search_start) >= loop_deadline:
                     break
 
                 cand_orig_x = int(round(cand[0] * scale))
@@ -1193,6 +1282,28 @@ def optimize_jumps(
                 total_gain = initial_cost - cand_cost
                 cand_sum_td = sum(cand_dists.get(t["comp"], 10.0) * t["weight"] for t in targets)
 
+                # Objetivos directamente desbloqueados o acercados por este salto
+                unlocked = [
+                    t for t in targets
+                    if cand_dists.get(t["comp"], 10.0) < state.dists.get(t["comp"], 10.0)
+                ]
+                if not unlocked:
+                    unlocked = [t for t in targets if cand_dists.get(t["comp"], 10.0) > 0.0]
+                if not unlocked:
+                    unlocked = [t for t in targets if t["comp"] in (touched_comps - entry_comps)]
+                if not unlocked:
+                    unlocked = targets
+
+                d_drop = _get_cand_drop_dist(cand_orig_x, cand_orig_y)
+                if unlocked:
+                    d_target = min(
+                        math.hypot(cand_orig_x - t["center"][0] * scale, cand_orig_y - t["center"][1] * scale)
+                        for t in unlocked
+                    )
+                else:
+                    d_target = 0.0
+                cand_travel = d_drop + target_dist_weight * d_target
+
                 cand_jump = JumpCandidate(
                     x=cand_orig_x,
                     y=cand_orig_y,
@@ -1200,6 +1311,8 @@ def optimize_jumps(
                     cost_before=state.cost,
                     cost_after=cand_cost,
                     bridged_compartments=sorted(touched_comps),
+                    drop_dist=d_drop,
+                    travel_dist=cand_travel,
                 )
 
                 new_state = BeamState(
@@ -1209,15 +1322,27 @@ def optimize_jumps(
                     total_gain=total_gain,
                     dists=cand_dists,
                     sum_target_dists=cand_sum_td,
+                    total_travel_dist=state.total_travel_dist + cand_travel,
                 )
                 next_expansions.append(new_state)
 
         if not next_expansions:
             break
 
-        # Ordenar expansiones por: mayor ganancia total, menor distancia agregada y menor costo
+        # Ordenar expansiones por:
+        # 1) Ganancia efectiva con penalización suave por recorrido total (despliegue -> salto -> objetivo)
+        # 2) Mayor ganancia pura
+        # 3) Menor recorrido acumulado (total_travel_dist)
+        # 4) Menor distancia agregada a objetivos (sum_target_dists)
+        # 5) Menor costo restante
         next_expansions.sort(
-            key=lambda s: (s.total_gain, -s.sum_target_dists, -s.cost),
+            key=lambda s: (
+                s.total_gain - distance_penalty_factor * s.total_travel_dist,
+                s.total_gain,
+                -s.total_travel_dist,
+                -s.sum_target_dists,
+                -s.cost,
+            ),
             reverse=True,
         )
 
@@ -1253,15 +1378,22 @@ def optimize_jumps(
     if force_max_jumps:
         best_state = max(
             all_evaluated_states,
-            key=lambda s: (s.total_gain, len(s.jumps), -s.cost),
+            key=lambda s: (
+                s.total_gain - distance_penalty_factor * s.total_travel_dist,
+                s.total_gain,
+                -s.total_travel_dist,
+                len(s.jumps),
+                -s.cost,
+            ),
         )
     else:
         states_with_gain = [s for s in all_evaluated_states if s.total_gain >= min_marginal_gain]
         if states_with_gain:
             max_gain = max(s.total_gain for s in states_with_gain)
             candidates_best = [s for s in states_with_gain if abs(s.total_gain - max_gain) < 1e-4]
-            # De los que empatan en ganancia máxima, seleccionar el que use menos saltos
-            best_state = min(candidates_best, key=lambda s: len(s.jumps))
+            # De los que empatan en ganancia máxima, seleccionar el que use menos saltos,
+            # y a igual número de saltos, el de menor recorrido total (despliegue -> salto -> objetivo)
+            best_state = min(candidates_best, key=lambda s: (len(s.jumps), s.total_travel_dist))
         else:
             best_state = root_state
 

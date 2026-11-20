@@ -51,7 +51,6 @@ class ClashStateMachine:
         self.state = BotState.ENSURE_GAME_READY
 
         # Templates
-        self.tpl_attack = "assets/buttons/attack_btn.png"
         self.tpl_attack_btns = [
             "assets/buttons/attack_btn.png",
             "assets/buttons/attack_btn_event.png",
@@ -62,7 +61,6 @@ class ClashStateMachine:
             "assets/buttons/attack_btn_confirm.png",
             "assets/buttons/confirm_attack_btn.png"
         ]
-        self.tpl_attack_confirm = "assets/buttons/confirm_attack_btn.png"
         self.tpl_next = "assets/buttons/next_btn.png"
         self.tpl_end_battle = "assets/buttons/end_battle.png"
         self.tpl_surrender_battle = "assets/buttons/surrender_battle.png"
@@ -80,7 +78,6 @@ class ClashStateMachine:
         ]
         if not self.tpl_return_homes:
             self.tpl_return_homes = [self.tpl_return_home]
-        self.tpl_claim_reward = "assets/buttons/claim_reward_btn.png"
         self.tpl_claim_rewards = [
             "assets/buttons/claim_reward_btn.png",
             "assets/buttons/claim_reward_text.png",
@@ -107,10 +104,16 @@ class ClashStateMachine:
         """
         Tras interactuar con un modal o cofre de evento al final de la batalla,
         espera y pulsa el botón Return Home para garantizar el regreso a la aldea principal.
+        Verifica primero si la aldea ya está lista para salir al instante y evitar taps fantasma.
         """
         t0 = time.monotonic()
         while time.monotonic() - t0 < timeout:
             s = self.device.screenshot()
+            # Salir al instante si al cerrar el cofre ya volvimos directo a la aldea
+            if self.proc_mgr.is_village_ready(s):
+                log.info("🏰 Aldea detectada visible y lista tras reclamar cofre. Retorno confirmado al instante.")
+                return True
+
             match_ret = self.vision.find_any(s, self.tpl_return_homes, threshold=0.72, zona="MITAD_INFERIOR")
             if match_ret:
                 log.info("🎯 Botón Return Home detectado en (%d, %d). Volviendo a la aldea...", match_ret[1], match_ret[2])
@@ -118,6 +121,11 @@ class ClashStateMachine:
                 time.sleep(2.5)
                 return True
             time.sleep(0.3)
+
+        s_final = self.device.screenshot()
+        if self.proc_mgr.is_village_ready(s_final):
+            log.info("🏰 Aldea lista tras timeout. Retorno confirmado sin usar UI Cache.")
+            return True
 
         cached_ret = self.ui_cache.get_pos("return_home_btn", self.device.width, self.device.height)
         log.info("🎯 Pulsando Return Home usando UI Cache en %s...", cached_ret)

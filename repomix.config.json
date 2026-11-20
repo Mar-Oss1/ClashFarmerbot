@@ -6,20 +6,18 @@
     "fileSummary": true,
     "directoryStructure": true,
     "removeComments": false,
-    "removeEmptyLines": false,
+    "removeEmptyLines": true,
     "topFilesLength": 10,
-    "showLineNumbers": false
+    "showLineNumbers": true
   },
   "include": [
+    "main.py",
     "core/**/*.py",
     "attack/**/*.py",
     "vision/**/*.py",
     "humanizer/**/*.py",
-    "tools/**/*.py",
-    "tests/**/*.py",
     "config/**/*.json",
-    "main.py",
-    "requirements.txt"
+    "requirements*.txt"
   ],
   "ignore": {
     "useGitignore": true,
@@ -42,11 +40,13 @@
       "models/**",
       "runs/**",
       "scratch/**",
+      "backups/**",
       "_backups/**",
       "backup_*/**",
       "_trash*/**",
       "clashfarmerbot_context.md",
       "repomix-output.*",
+      "repomix-*.txt",
       "*.md",
       "*.png",
       "*.jpg",

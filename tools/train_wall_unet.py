@@ -31,13 +31,36 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 # Agregar raíz del proyecto al path
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FILE_DIR = os.path.dirname(os.path.abspath(__file__))
+if os.path.basename(FILE_DIR) in {"tools", "scripts", "bin"}:
+    PROJECT_ROOT = os.path.dirname(FILE_DIR)
+else:
+    PROJECT_ROOT = FILE_DIR
+
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from core.logger import get_logger
 
-log = get_logger("train_wall_unet")
+def _resolve_path(path_str: str) -> str:
+    if os.path.isabs(path_str):
+        return path_str
+    return os.path.normpath(os.path.join(PROJECT_ROOT, path_str))
+
+
+# Logging modular con fallback transparente para ejecución standalone (ej. Google Colab)
+try:
+    from core.logger import get_logger
+
+    log = get_logger("train_wall_unet")
+except ImportError:
+    import logging
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    log = logging.getLogger("train_wall_unet")
 
 # ==============================================================================
 # Constantes de módulo compartidas
@@ -57,31 +80,47 @@ def apply_augmentations(
     """
     Aplica augmentaciones respetando las restricciones isométricas de Clash of Clans:
     - Espejo horizontal únicamente (prob 0.5)
-    - Variación de contraste/brillo (prob 0.7, alpha 0.80-1.20, beta -20 a 20)
-    - Variación de Hue/Sat en HSV (prob 0.5, hue +-12, sat +-25)
-    NUNCA rota ni voltea verticalmente.
+    - RandomBrightnessContrast (prob 0.7, alpha 0.70-1.30, beta -35 a 35)
+    - HueSaturationValue (prob 0.7, hue +-20, sat +-40, val +-30) para sceneries y niveles de muro
+    - CoarseDropout / Cutout (prob 0.5, 4-12 parches rectangulares de 12-32 px para robustez ante tropas/humo)
+    NUNCA rota ni voltea verticalmente debido a la perspectiva isométrica fija.
     """
+    h, w = img_rgb.shape[:2]
+
     # 1. Flip horizontal únicamente
     if random.random() < 0.5:
         img_rgb = cv2.flip(img_rgb, 1)
         mask = cv2.flip(mask, 1)
 
-    # 2. Contraste y brillo
+    # 2. RandomBrightnessContrast
     if random.random() < 0.7:
-        alpha = random.uniform(0.80, 1.20)
-        beta = random.uniform(-20.0, 20.0)
+        alpha = random.uniform(0.70, 1.30)
+        beta = random.uniform(-35.0, 35.0)
         img_rgb = np.clip(alpha * img_rgb.astype(np.float32) + beta, 0, 255).astype(
             np.uint8
         )
 
-    # 3. Hue y Saturación en HSV
-    if random.random() < 0.5:
+    # 3. HueSaturationValue (HSV)
+    if random.random() < 0.7:
         hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
-        dh = random.uniform(-12.0, 12.0)
-        ds = random.uniform(-25.0, 25.0)
+        dh = random.uniform(-20.0, 20.0)
+        ds = random.uniform(-40.0, 40.0)
+        dv = random.uniform(-30.0, 30.0)
         hsv[..., 0] = (hsv[..., 0] + dh) % 180.0
         hsv[..., 1] = np.clip(hsv[..., 1] + ds, 0.0, 255.0)
+        hsv[..., 2] = np.clip(hsv[..., 2] + dv, 0.0, 255.0)
         img_rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+    # 4. CoarseDropout (Cutout de parches pequeños sin alterar la máscara)
+    if random.random() < 0.5:
+        num_holes = random.randint(4, 12)
+        for _ in range(num_holes):
+            hole_h = random.randint(12, min(32, h))
+            hole_w = random.randint(12, min(32, w))
+            y1 = random.randint(0, max(0, h - hole_h))
+            x1 = random.randint(0, max(0, w - hole_w))
+            fill_val = random.choice([0, 128, random.randint(0, 255)])
+            img_rgb[y1 : y1 + hole_h, x1 : x1 + hole_w] = fill_val
 
     return img_rgb, mask
 
@@ -233,15 +272,14 @@ def export_to_onnx(
     """
     Exporta el modelo U-Net a ONNX con opset 13 y nombres estandarizados:
     input_names=['input'], output_names=['logits'].
+    Mueve explícitamente el modelo y el tensor dummy a CPU para garantizar
+    exportación limpia y portable tanto desde GPU CUDA como desde CPU.
     """
     model.eval()
+    model_cpu = model.to("cpu")
     dummy_input = torch.randn(1, 3, img_h, img_w, device="cpu")
 
-    dest_abs = (
-        onnx_path
-        if os.path.isabs(onnx_path)
-        else os.path.join(PROJECT_ROOT, onnx_path)
-    )
+    dest_abs = _resolve_path(onnx_path)
     os.makedirs(os.path.dirname(dest_abs), exist_ok=True)
 
     log.info(
@@ -255,7 +293,7 @@ def export_to_onnx(
     try:
         try:
             torch.onnx.export(
-                model.to("cpu"),
+                model_cpu,
                 dummy_input,
                 dest_abs,
                 export_params=True,
@@ -267,7 +305,7 @@ def export_to_onnx(
             )
         except TypeError:
             torch.onnx.export(
-                model.to("cpu"),
+                model_cpu,
                 dummy_input,
                 dest_abs,
                 export_params=True,
@@ -297,11 +335,7 @@ def verify_onnx_inference(
     Ejecuta una inferencia dummy con onnxruntime (CPUExecutionProvider)
     para certificar la validez del artefacto generado.
     """
-    dest_abs = (
-        onnx_path
-        if os.path.isabs(onnx_path)
-        else os.path.join(PROJECT_ROOT, onnx_path)
-    )
+    dest_abs = _resolve_path(onnx_path)
     if not os.path.isfile(dest_abs):
         log.error("Archivo ONNX no encontrado para verificación: %s", dest_abs)
         return False, None
@@ -341,18 +375,16 @@ def train_wall_unet(
     lr: float = 1e-3,
     device: Optional[str] = None,
     checkpoint_out: str = "runs/wall_unet_best.pt",
+    pt_out: Optional[str] = None,
     dry_run: bool = False,
 ) -> int:
     """
     Entrena el modelo U-Net (MobileNetV2 encoder) con MobileNetV2 y exporta a ONNX.
+    Detecta automáticamente GPU CUDA o CPU si device=None.
     """
     import segmentation_models_pytorch as smp
 
-    resolved_data_dir = (
-        data_dir
-        if os.path.isabs(data_dir)
-        else os.path.join(PROJECT_ROOT, data_dir)
-    )
+    resolved_data_dir = _resolve_path(data_dir)
     train_split = os.path.join(resolved_data_dir, "train")
     val_split = os.path.join(resolved_data_dir, "val")
 
@@ -374,7 +406,7 @@ def train_wall_unet(
             val_split,
         )
 
-    # Dispositivo
+    # Dispositivo: auto-detección CUDA si no se especifica
     if device is None:
         target_device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -384,17 +416,20 @@ def train_wall_unet(
     log.info("Entrenando en dispositivo: %s", target_device)
 
     # Dataloaders
+    use_cuda = target_device.type == "cuda"
     train_loader = DataLoader(
         train_dataset,
         batch_size=min(batch_size, len(train_dataset)),
         shuffle=True,
         drop_last=False,
+        pin_memory=use_cuda,
     )
     eval_dataset = val_dataset if has_val else train_dataset
     val_loader = DataLoader(
         eval_dataset,
         batch_size=min(batch_size, len(eval_dataset)),
         shuffle=False,
+        pin_memory=use_cuda,
     )
 
     # Construcción de modelo
@@ -429,11 +464,7 @@ def train_wall_unet(
     )
 
     best_dice = -1.0
-    checkpoint_abs = (
-        checkpoint_out
-        if os.path.isabs(checkpoint_out)
-        else os.path.join(PROJECT_ROOT, checkpoint_out)
-    )
+    checkpoint_abs = _resolve_path(checkpoint_out)
     os.makedirs(os.path.dirname(checkpoint_abs), exist_ok=True)
 
     log.info(
@@ -448,8 +479,8 @@ def train_wall_unet(
         model.train()
         train_loss_acc = 0.0
         for imgs, masks in train_loader:
-            imgs = imgs.to(target_device)
-            masks = masks.to(target_device)
+            imgs = imgs.to(target_device, non_blocking=use_cuda)
+            masks = masks.to(target_device, non_blocking=use_cuda)
 
             optimizer.zero_grad()
             logits = model(imgs)
@@ -470,8 +501,8 @@ def train_wall_unet(
 
         with torch.no_grad():
             for imgs, masks in val_loader:
-                imgs = imgs.to(target_device)
-                masks = masks.to(target_device)
+                imgs = imgs.to(target_device, non_blocking=use_cuda)
+                masks = masks.to(target_device, non_blocking=use_cuda)
 
                 logits = model(imgs)
                 loss = loss_fn(logits, masks)
@@ -498,21 +529,24 @@ def train_wall_unet(
         # Guardar mejor modelo por Dice
         if avg_val_dice > best_dice:
             best_dice = avg_val_dice
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "best_dice": best_dice,
-                    "img_size": (IMG_W, IMG_H),
-                },
-                checkpoint_abs,
-            )
+            state_dict = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "best_dice": best_dice,
+                "img_size": (IMG_W, IMG_H),
+            }
+            torch.save(state_dict, checkpoint_abs)
             log.info(
                 "⭐ Nuevo mejor checkpoint guardado en '%s' (Dice: %.4f)",
                 checkpoint_abs,
                 best_dice,
             )
+            if pt_out:
+                pt_dest_abs = _resolve_path(pt_out)
+                os.makedirs(os.path.dirname(pt_dest_abs), exist_ok=True)
+                torch.save(state_dict, pt_dest_abs)
+                log.info("Checkpoint .pt también guardado en: '%s'", pt_dest_abs)
 
     # 3. Exportación a ONNX desde el mejor checkpoint
     log.info("Cargando mejor checkpoint desde '%s' para exportar...", checkpoint_abs)
@@ -539,6 +573,8 @@ def train_wall_unet(
     log.info("Entrenamiento y exportación U-Net completados con éxito.")
     log.info("Mejor Dice Score alcanzado: %.4f", best_dice)
     log.info("Modelo ONNX guardado en: %s", onnx_out)
+    if pt_out:
+        log.info("Checkpoint .pt guardado en: %s", pt_out)
     log.info("Forma de salida de inferencia verificada: %s", out_shape)
     log.info("=================================================================")
     return 0
@@ -594,6 +630,12 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="Ruta donde guardar el mejor checkpoint PyTorch (default: runs/wall_unet_best.pt)",
     )
     parser.add_argument(
+        "--pt-out",
+        type=str,
+        default=None,
+        help="Ruta opcional para guardar una copia del mejor checkpoint .pt (ej. Google Drive)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Ejecuta solo 1 época para validar el flujo completo sin entrenar a fondo",
@@ -612,6 +654,7 @@ def main() -> int:
         lr=args.lr,
         device=args.device,
         checkpoint_out=args.checkpoint_out,
+        pt_out=args.pt_out,
         dry_run=args.dry_run,
     )
 

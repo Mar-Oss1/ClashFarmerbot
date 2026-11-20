@@ -385,3 +385,10 @@ def get_deploy_zone_detector() -> DeployZoneDetector:
         )
     return _default_detector
 
+
+def reset_deploy_zone_detector() -> None:
+    """Restablece la instancia singleton de DeployZoneDetector (útil en tests)."""
+    global _default_detector
+    _default_detector = None
+
+

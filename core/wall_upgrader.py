@@ -316,18 +316,11 @@ class WallUpgrader:
         # Plantilla legacy (18 -> 19) mantenida para compatibilidad 100% garantizada
         self.tpl_wall_row = "assets/buttons/wall_row_item.png"
 
-        # 2. Filtros apagados (marrón)
-        self.tpl_filter_gold_off = "assets/buttons/filter_gold_off.png"
-        self.tpl_filter_elixir_off = "assets/buttons/filter_elixir_off.png"
-        self.tpl_filter_perm_off = "assets/buttons/filter_perm_off.png"
-
-        # 3. Secuencia de selección múltiple (Muros dinámicos)
+        # 2. Secuencia de selección múltiple (Muros dinámicos)
         self.tpl_upgrade_more = "assets/buttons/upgrade_more_btn.png"      # Botón "Upgrade More"
         self.tpl_add_wall_1 = "assets/buttons/add_wall_1_btn.png"          # Botón "+1 Add Wall"
         self.tpl_remove_wall_1 = "assets/buttons/remove_wall_1_btn.png"    # Botón "-1 Remove Wall"
         self.tpl_upgrade_hammers = "assets/buttons/upgrade_hammers.png"     # Martillos + Upgrade
-        self.tpl_upgrade_gold = "assets/buttons/upgrade_with_gold.png"
-        self.tpl_upgrade_elixir = "assets/buttons/upgrade_with_elixir.png"
         self.tpl_confirm = "assets/buttons/confirm_upgrade_btn.png"
         self.tpl_dialog_confirm = "assets/buttons/dialog_confirm_btn.png"   # Botón verde de validación múltiple
 
@@ -352,14 +345,14 @@ class WallUpgrader:
     FILTER_BUTTON_ROIS = {
         "gold": (0.198, 0.265, 0.408, 0.504),
         "elixir": (0.198, 0.265, 0.523, 0.619),
-        "perm": (0.431, 0.498, 0.635, 0.731),
+        "perm": (0.465, 0.536, 0.634, 0.737),
     }
 
     # Coordenadas relativas de tap (rx, ry) al centro de cada botón de filtro
     FILTER_BUTTON_TAPS = {
         "gold": (0.456, 0.231),
         "elixir": (0.571, 0.231),
-        "perm": (0.683, 0.465),
+        "perm": (0.685, 0.501),
     }
 
     def reset_filter_cache(self) -> None:
@@ -405,7 +398,7 @@ class WallUpgrader:
             return False
 
         pct = float(np.mean(mask[border_mask]))
-        return pct >= 0.40
+        return pct >= 0.30
 
     def detect_filter_states(self, screen: np.ndarray) -> Dict[str, bool]:
         """Detecta el estado activo (True/False) de los 3 botones principales de filtro."""
@@ -418,8 +411,11 @@ class WallUpgrader:
         """
         Abre el menú de filtros del constructor y aplica la combinación óptima (RSS + Permanente):
         - Usa caché de sesión en RAM: si los filtros ya están en el estado objetivo, omite abrir el menú (0 clicks).
-        - Si necesita abrir el menú, detecta el estado real (ON/OFF) de cada botón vía HSV
-          y pulsa ÚNICAMENTE los que difieran del estado objetivo (apagando Gold al pasar a Elixir y viceversa).
+        - Si necesita abrir el menú, detecta el estado real (ON/OFF) de cada botón vía HSV.
+        - Los filtros 'gold' y 'elixir' son radio buttons mutuamente excluyentes en CoC:
+          activar uno apaga automáticamente el otro. Solo se pulsa el recurso deseado si está inactivo (False);
+          NUNCA se pulsa el recurso contrario para 'apagarlo'.
+        - Se pulsa 'perm' solo si su estado actual es inactivo (False).
         """
         target_state = (
             {"gold": True, "elixir": False, "perm": True}
@@ -448,18 +444,29 @@ class WallUpgrader:
         w = getattr(self.device, "width", menu_screen.shape[1] if menu_screen is not None else 2400)
         h = getattr(self.device, "height", menu_screen.shape[0] if menu_screen is not None else 1080)
 
-        # Pulsar ÚNICAMENTE los botones cuyo estado actual difiera de target_state
-        for key in ("gold", "elixir", "perm"):
-            if current_state.get(key) != target_state.get(key):
-                desired = target_state[key]
-                action_str = "Activando" if desired else "Desactivando"
-                log.info("🎯 Filtro %s en estado %s (objetivo: %s). %s...", key.upper(), current_state.get(key), desired, action_str)
-                rx, ry = self.FILTER_BUTTON_TAPS[key]
-                tap_x, tap_y = int(rx * w), int(ry * h)
-                HumanBehavior.reaction_delay()
-                self.device.tap(tap_x, tap_y)
-                time.sleep(0.4)
-                current_state[key] = desired
+        desired_res = "gold" if resource_type == "gold" else "elixir"
+        other_res = "elixir" if desired_res == "gold" else "gold"
+
+        # Solo pulsar el recurso deseado si su estado actual es False. NUNCA pulsar el recurso contrario.
+        if not current_state.get(desired_res, False):
+            log.info("🎯 Filtro %s en estado inactivo. Activando...", desired_res.upper())
+            rx, ry = self.FILTER_BUTTON_TAPS[desired_res]
+            tap_x, tap_y = int(rx * w), int(ry * h)
+            HumanBehavior.reaction_delay()
+            self.device.tap(tap_x, tap_y)
+            time.sleep(0.4)
+            current_state[desired_res] = True
+            current_state[other_res] = False
+
+        # Pulsar perm solo si su estado actual es False
+        if not current_state.get("perm", False):
+            log.info("🎯 Filtro PERM en estado inactivo. Activando...")
+            rx, ry = self.FILTER_BUTTON_TAPS["perm"]
+            tap_x, tap_y = int(rx * w), int(ry * h)
+            HumanBehavior.reaction_delay()
+            self.device.tap(tap_x, tap_y)
+            time.sleep(0.4)
+            current_state["perm"] = True
 
         # Cerrar el menú desplegable tocando de nuevo el botón de filtro
         log.info("Cerrando desplegable de filtros...")
@@ -505,7 +512,7 @@ class WallUpgrader:
                 if search_area.shape[0] >= th and search_area.shape[1] >= tw:
                     res = cv2.matchTemplate(search_area, lbl_gray, cv2.TM_CCOEFF_NORMED)
                     min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
-                    if max_val >= 0.85:
+                    if max_val >= 0.82:
                         mx, my = max_loc[0] + off_x, max_loc[1] + off_y
                         match_roi = screen_gray[my : my + th, mx : mx + tw]
                         bin_match = cv2.threshold(match_roi, 180, 255, cv2.THRESH_BINARY)[1]
@@ -513,17 +520,56 @@ class WallUpgrader:
 
                         # Verificar presencia de texto blanco ('Wall' contiene >= 250 px blancos)
                         if white_pixels >= 250:
-                            # Verificar que a la derecha inmediata no haya letras pegadas
+                            # Verificar que a la derecha sea un nombre válido de muro ('Wall' o 'Wall x N')
+                            # y no una palabra compuesta (ej. 'Wall Wrecker') ni letras adheridas
+                            strip_w = 140
                             x_right_start = mx + tw
-                            x_right_end = min(screen_gray.shape[1], mx + tw + 20)
-                            right_strip = screen_gray[my + 6 : my + th - 6, x_right_start : x_right_end]
+                            x_right_end = min(screen_gray.shape[1], mx + tw + strip_w)
+                            right_strip = screen_gray[my + 4 : my + th - 4, x_right_start : x_right_end]
                             bin_right = cv2.threshold(right_strip, 180, 255, cv2.THRESH_BINARY)[1] if right_strip.size > 0 else np.zeros((1, 1), dtype=np.uint8)
 
+                            col_sums = np.sum(bin_right > 0, axis=0) if bin_right.size > 0 else np.array([])
+                            total_white_right = int(np.sum(col_sums))
+
                             has_attached_letters = False
-                            if right_strip.size > 0:
-                                col_sums = np.sum(bin_right > 0, axis=0)
-                                if any(c >= 8 for c in col_sums[:12]) or np.sum(bin_right > 0) >= 35:
-                                    has_attached_letters = True
+                            if total_white_right >= 15:
+                                runs = []
+                                in_run, start = False, 0
+                                for i, c in enumerate(col_sums):
+                                    if c >= 3:
+                                        if not in_run:
+                                            in_run, start = True, i
+                                    else:
+                                        if in_run:
+                                            in_run = False
+                                            runs.append((start, i))
+                                if in_run:
+                                    runs.append((start, len(col_sums)))
+
+                                if runs:
+                                    words = []
+                                    cur_start, cur_end = runs[0]
+                                    for nxt_start, nxt_end in runs[1:]:
+                                        if nxt_start - cur_end <= 4:
+                                            cur_end = nxt_end
+                                        else:
+                                            words.append((cur_start, cur_end, cur_end - cur_start))
+                                            cur_start, cur_end = nxt_start, nxt_end
+                                    words.append((cur_start, cur_end, cur_end - cur_start))
+
+                                    first_w_start, first_w_end, first_w_len = words[0]
+                                    first_roi = bin_right[:, first_w_start:first_w_end]
+                                    density = float(np.mean(first_roi > 0))
+
+                                    # Bloque pegado sin margen limpio en el borde (ej. letras adheridas sin espacio)
+                                    if first_w_start == 0 and (density > 0.60 or first_roi.shape[1] >= 15):
+                                        has_attached_letters = True
+                                    # Si el primer token es una palabra larga (> 18px), es un nombre compuesto (ej. 'Wrecker')
+                                    elif first_w_len > 18:
+                                        has_attached_letters = True
+                                    # Si es 'x' seguido de número, debe existir una separación clara antes del número
+                                    elif len(words) > 1 and (words[1][0] - first_w_end < 5):
+                                        has_attached_letters = True
 
                             if not has_attached_letters:
                                 wall_pos = (mx + tw // 2, my + th // 2)
@@ -533,7 +579,7 @@ class WallUpgrader:
             else:
                 # Si _load_template no está disponible (mocked vision), buscar con find_template
                 wall_pos = self.vision.find_template(
-                    screen, self.tpl_wall_label, threshold=0.85, zona="MITAD_DERECHA"
+                    screen, self.tpl_wall_label, threshold=0.82, zona="MITAD_DERECHA"
                 )
 
             # 2. Fallback a wall_row_generic.png / wall_row_item.png con umbral elevado a 0.85

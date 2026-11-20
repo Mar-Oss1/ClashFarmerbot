@@ -59,6 +59,52 @@ class TestJumpPlannerIntegration(unittest.TestCase):
         self.assertEqual(targets[1], (1280, 480))
 
     @patch("vision.wall_compartments.optimize_jumps")
+    def test_compute_adaptive_jump_targets_passes_drop_points(self, mock_opt):
+        """Verifica que drop_points se propaga correctamente a optimize_jumps()."""
+        mock_opt.return_value = MagicMock(jumps=[], debug_overlay=None)
+
+        test_settings = dict(SETTINGS)
+        test_settings["attack"] = dict(SETTINGS.get("attack", {}))
+        test_settings["attack"]["jump_placement"] = "coverage_optimizer"
+
+        custom_drops = [(500, 200), (1800, 200)]
+        with patch.dict(ds_mod.SETTINGS, test_settings):
+            compute_adaptive_jump_targets_from_detections(
+                self.detections, (self.w, self.h), screen=self.screen, drop_points=custom_drops
+            )
+
+        mock_opt.assert_called_once()
+        _, kwargs = mock_opt.call_args
+        self.assertEqual(kwargs.get("drop_points"), custom_drops)
+
+    def test_deploy_flank_spells_uses_jump_planner(self):
+        """Verifica que _deploy_flank_spells use jump_planner.plan_flank_jump_crossings."""
+        mock_dev = MagicMock()
+        mock_dev.width = 2400
+        mock_dev.height = 1080
+        mock_vis = MagicMock()
+        mock_army = MagicMock()
+        strat = DeploymentStrategy(mock_dev, mock_vis, mock_army)
+        strat._troop_inventory["jump"] = 2
+        strat._troop_inventory["haste"] = 1
+
+        flank_storage = Detection(cls_name="storage_gold", confidence=0.9, bbox_xyxy=(1200, 300, 1260, 360), center=(1230, 330))
+        reachable = [(flank_storage, (1230, 160))]
+
+        with patch.object(strat, "_ensure_spell_selected", return_value=True), \
+             patch("attack.jump_planner.plan_flank_jump_crossings", return_value=[(1230, 245)]) as mock_cross:
+            strat._deploy_flank_spells(
+                screen=np.zeros((1080, 2400, 3), dtype=np.uint8),
+                zone_name="NORTE",
+                reachable_targets=reachable,
+                green_contour=np.array([[1000, 100], [1500, 100], [1500, 800], [1000, 800]]),
+                safe_y_min=140,
+                safe_y_max=845,
+            )
+            mock_cross.assert_called_once()
+            self.assertEqual(strat._troop_inventory["jump"], 1)
+
+    @patch("vision.wall_compartments.optimize_jumps")
     def test_compartments_mode_invokes_optimize_jumps(self, mock_opt):
         """Verifica que jump_placement='compartments' es un alias válido que invoca optimize_jumps()."""
         mock_opt.return_value = MagicMock(

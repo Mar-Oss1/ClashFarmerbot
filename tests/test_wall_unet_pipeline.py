@@ -284,7 +284,8 @@ class TestWallSegDetector(unittest.TestCase):
         mock_session.run.return_value = [logits]
 
         with patch("os.path.exists", return_value=True), \
-             patch("onnxruntime.InferenceSession", return_value=mock_session):
+             patch("onnxruntime.InferenceSession", return_value=mock_session), \
+             patch("vision.deploy_zone_detector.get_deploy_zone_detector", return_value=None):
             detector = WallSegDetector(model_path="models/wall_seg.onnx", conf_thresh=0.5)
             self.assertTrue(detector.is_ready())
 
@@ -305,6 +306,35 @@ class TestWallSegDetector(unittest.TestCase):
             overlay = detector.build_overlay(frame_bgr, mask)
             self.assertEqual(overlay.shape, (1080, 2400, 3))
             self.assertEqual(overlay.dtype, np.uint8)
+
+    def test_predict_postprocessing_deploy_zone_and_morph(self):
+        """Valida que predict() ponga en 0 el césped exterior vía deploy_zone_mask y selle fisuras."""
+        mock_session = MagicMock()
+        mock_input = MagicMock()
+        mock_input.name = "input"
+        mock_input.shape = [1, 3, 352, 768]
+        mock_session.get_inputs.return_value = [mock_input]
+        mock_session.get_outputs.return_value = [MagicMock(name="output")]
+
+        # Logits con señal positiva general
+        logits = np.full((1, 1, 352, 768), 5.0, dtype=np.float32)
+        mock_session.run.return_value = [logits]
+
+        with patch("os.path.exists", return_value=True), \
+             patch("onnxruntime.InferenceSession", return_value=mock_session), \
+             patch("vision.deploy_zone_detector.get_deploy_zone_detector", return_value=None):
+            detector = WallSegDetector(model_path="models/wall_seg.onnx", conf_thresh=0.5)
+
+            frame_bgr = np.zeros((1080, 2400, 3), dtype=np.uint8)
+            # Deploy zone mask: solo la mitad derecha es aldea (1), la izquierda es césped (0)
+            deploy_mask = np.zeros((1080, 2400), dtype=np.uint8)
+            deploy_mask[:, 1200:] = 1
+
+            mask = detector.predict(frame_bgr, deploy_zone_mask=deploy_mask)
+            # La mitad izquierda (deploy_zone_mask == 0) debe estar estrictamente en 0
+            self.assertEqual(np.count_nonzero(mask[:, :1200]), 0)
+            # La mitad derecha (aldea) fuera del HUD debe contener píxeles de muro (255)
+            self.assertTrue(np.any(mask[:, 1200:] == 255))
 
     def test_get_wall_seg_detector_reads_conf_from_settings(self):
         """Valida que get_wall_seg_detector() resuelva wall_seg_conf desde settings.json y permita overrides."""

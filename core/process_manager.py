@@ -16,9 +16,7 @@ class ProcessManager:
         self.device = device
         self.vision = vision
 
-        # Botón de ataque para confirmar aldea lista
-        self.tpl_attack_btn = "assets/buttons/attack_btn.png"
-        self.tpl_attack_event_btn = "assets/buttons/attack_btn_event.png"
+        # Botones de ataque para confirmar aldea lista
         self.tpl_attack_btns = [
             "assets/buttons/attack_btn.png",
             "assets/buttons/attack_btn_event.png",
@@ -159,9 +157,9 @@ class ProcessManager:
             return True
 
         for cofre_idx in range(1, 4):
-            # Comprobar primero si cur_screen actual ya tiene cofre
+            # Comprobar primero si cur_screen actual ya tiene cofre (zona COMPLETA)
             chest_match = self.vision.find_any(
-                cur_screen, self.tpl_chest_indicators, threshold=0.70, zona="MITAD_SUPERIOR"
+                cur_screen, self.tpl_chest_indicators, threshold=0.70, zona="COMPLETA"
             )
 
             # Si no está en cur_screen:
@@ -170,8 +168,8 @@ class ProcessManager:
                 if not wait_for_chest and not handled_any:
                     break
 
-                # Tiempo de espera activo: 5.0s si wait_for_chest=True en primera vuelta, o máx 2.5s para cofres encadenados
-                wait_timeout = 5.0 if (wait_for_chest and not handled_any) else 2.5
+                # Tiempo de espera activo: 3.0s si wait_for_chest=True en primera vuelta, o máx 2.5s para cofres encadenados
+                wait_timeout = 3.0 if (wait_for_chest and not handled_any) else 2.5
                 t_wait_chest = time.monotonic()
                 while time.monotonic() - t_wait_chest < wait_timeout:
                     cur_screen = self.device.screenshot()
@@ -187,17 +185,29 @@ class ProcessManager:
                         break
 
                     chest_match = self.vision.find_any(
-                        cur_screen, self.tpl_chest_indicators, threshold=0.70, zona="MITAD_SUPERIOR"
+                        cur_screen, self.tpl_chest_indicators, threshold=0.70, zona="COMPLETA"
                     )
                     if chest_match:
                         break
                     time.sleep(0.35)
 
             if not chest_match:
-                # No hay más cofres pendientes de abrir
-                break
+                # Si wait_for_chest=True y tras esperar 3.0s no aparece Continue ni matchean los templates
+                # del cofre pero tampoco estamos en la aldea (not is_village_ready()), ejecuta igualmente
+                # los 4 taps al centro (cx, cy) y espera Continue como fallback seguro.
+                if wait_for_chest and not handled_any and not self.is_village_ready(cur_screen):
+                    log.warning(
+                        "⚠️ Cofre/Continue no detectado por template tras 3.0s y la aldea no está lista. "
+                        "Ejecutando 4 taps al centro (%d, %d) como fallback seguro...",
+                        cx, cy
+                    )
+                else:
+                    # No hay más cofres pendientes de abrir
+                    break
 
-            log.info("📦 Cofre de recompensa detectado (#%d) en (%d, %d). Dando 4 taps al centro...", cofre_idx, chest_match[1], chest_match[2])
+            t_x = chest_match[1] if chest_match else cx
+            t_y = chest_match[2] if chest_match else cy
+            log.info("📦 Cofre de recompensa detectado (#%d) en (%d, %d). Dando 4 taps al centro...", cofre_idx, t_x, t_y)
             handled_any = True
 
             # Dar 4 taps al centro sobre el cofre

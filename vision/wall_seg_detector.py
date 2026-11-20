@@ -94,11 +94,29 @@ class WallSegDetector:
         conf_thresh: float = 0.50,
         imgsz: int = 1280,
         strict: bool = False,
+        morph_closing_enabled: bool | None = None,
+        morph_kernel_length: int | None = None,
+        morph_angles: list[float] | None = None,
     ):
         self.model_path = model_path
         self.conf_thresh = conf_thresh
         self.imgsz = imgsz
         self.strict = strict
+
+        cfg = SETTINGS.get("attack", {}).get("wall_seg", SETTINGS.get("wall_seg", {}))
+        self.morph_closing_enabled = bool(
+            morph_closing_enabled if morph_closing_enabled is not None
+            else cfg.get("morph_closing_enabled", True)
+        )
+        self.morph_kernel_length = int(
+            morph_kernel_length if morph_kernel_length is not None
+            else cfg.get("morph_kernel_length", 9)
+        )
+        self.morph_angles = list(
+            morph_angles if morph_angles is not None
+            else cfg.get("morph_angles", [36.0, 144.0])
+        )
+
         self.session = None
         self.input_name: str | None = None
         self.output_names: list[str] = []
@@ -246,7 +264,37 @@ class WallSegDetector:
                     mask_full = cv2.resize(cropped_proto, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
                     mask_native = (mask_full >= 0.5).astype(np.uint8) * 255
 
+            # Post-procesado: deploy_zone_mask, cierre morfológico direccional y HUD mask
+            if deploy_zone_mask is None:
+                try:
+                    from vision.deploy_zone_detector import get_deploy_zone_detector
+                    dzd = get_deploy_zone_detector()
+                    if dzd is not None and dzd.is_ready():
+                        deploy_zone_mask = dzd.predict_mask(frame_bgr)
+                except Exception as e:
+                    log.debug("Auto deploy_zone_mask retrieval skipped: %s", e)
+
+            if deploy_zone_mask is not None and isinstance(deploy_zone_mask, np.ndarray):
+                if deploy_zone_mask.shape[:2] != (orig_h, orig_w):
+                    deploy_zone_mask = cv2.resize(deploy_zone_mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+                # En deploy_zone_detector: 0 = exterior (césped legal), 1 = aldea (rojo)
+                mask_native[deploy_zone_mask == 0] = 0
+
+            if self.morph_closing_enabled and np.any(mask_native > 0):
+                closed_layers = []
+                for ang in self.morph_angles:
+                    k = _get_line_kernel(self.morph_kernel_length, ang)
+                    closed_layers.append(cv2.morphologyEx(mask_native, cv2.MORPH_CLOSE, k))
+                if closed_layers:
+                    combined_closed = closed_layers[0]
+                    for layer in closed_layers[1:]:
+                        combined_closed = cv2.bitwise_or(combined_closed, layer)
+                    mask_native = combined_closed
+
             mask_native[hud_mask > 0] = 0
+            if deploy_zone_mask is not None and isinstance(deploy_zone_mask, np.ndarray):
+                mask_native[deploy_zone_mask == 0] = 0
+
             return mask_native
         except Exception as e:
             log.warning("Fallo en inferencia ONNX de WallSegDetector (%s). Usando fallback.", e)
@@ -268,11 +316,16 @@ class WallSegDetector:
         clean_canvas = build_clean_wall_canvas(screenshot, detections, deploy_zone_mask)
         edges = cv2.Canny(clean_canvas, 45, 135)
 
-        k1 = _get_line_kernel(9, 36.0)
-        k2 = _get_line_kernel(9, 144.0)
-        c1 = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k1)
-        c2 = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k2)
-        wall_binary = cv2.bitwise_or(c1, c2)
+        closed_layers = []
+        for ang in self.morph_angles:
+            k = _get_line_kernel(self.morph_kernel_length, ang)
+            closed_layers.append(cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k))
+        if closed_layers:
+            wall_binary = closed_layers[0]
+            for layer in closed_layers[1:]:
+                wall_binary = cv2.bitwise_or(wall_binary, layer)
+        else:
+            wall_binary = edges
 
         contours, _ = cv2.findContours(wall_binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         mask = np.zeros_like(wall_binary)
@@ -328,6 +381,9 @@ _DEFAULT_WALL_SEG_DETECTOR: Optional[WallSegDetector] = None
 def get_wall_seg_detector(
     model_path: str | None = None,
     conf_thresh: float | None = None,
+    morph_closing_enabled: bool | None = None,
+    morph_kernel_length: int | None = None,
+    morph_angles: list[float] | None = None,
 ) -> WallSegDetector:
     """Obtiene o inicializa el singleton predeterminado de WallSegDetector leyendo settings.json si no se pasan parámetros."""
     global _DEFAULT_WALL_SEG_DETECTOR
@@ -339,10 +395,16 @@ def get_wall_seg_detector(
         _DEFAULT_WALL_SEG_DETECTOR is None
         or _DEFAULT_WALL_SEG_DETECTOR.model_path != resolved_path
         or _DEFAULT_WALL_SEG_DETECTOR.conf_thresh != resolved_conf
+        or (morph_closing_enabled is not None and _DEFAULT_WALL_SEG_DETECTOR.morph_closing_enabled != morph_closing_enabled)
+        or (morph_kernel_length is not None and _DEFAULT_WALL_SEG_DETECTOR.morph_kernel_length != morph_kernel_length)
+        or (morph_angles is not None and _DEFAULT_WALL_SEG_DETECTOR.morph_angles != morph_angles)
     ):
         _DEFAULT_WALL_SEG_DETECTOR = WallSegDetector(
             model_path=resolved_path,
             conf_thresh=resolved_conf,
+            morph_closing_enabled=morph_closing_enabled,
+            morph_kernel_length=morph_kernel_length,
+            morph_angles=morph_angles,
         )
     return _DEFAULT_WALL_SEG_DETECTOR
 

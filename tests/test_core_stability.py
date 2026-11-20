@@ -69,15 +69,52 @@ class TestProcessManagerPerformance(unittest.TestCase):
         self.assertFalse(res_no_wait)
         self.assertLess(dur_no_wait, 0.05)
 
-        # 2. Con wait_for_chest=True: debe intentar esperar activamente cofre (limitado a timeout)
-        with patch("time.sleep", return_value=None):
-            with patch("time.monotonic", side_effect=[0.0, 1.0, 3.0, 5.5, 6.0]):
-                res_wait = self.proc_mgr.handle_chest_reward_sequence(
-                    self.clean_screen, wait_for_chest=True
-                )
-                self.assertFalse(res_wait)
-                # Debe haber intentado tomar capturas periódicas esperando que aparezca el cofre
-                self.assertGreaterEqual(self.mock_device.screenshot.call_count, 1)
+        # 2. Con wait_for_chest=True y aldea lista: no debe activar fallback y retorna False
+        with patch.object(self.proc_mgr, "is_village_ready", return_value=True):
+            with patch("time.sleep", return_value=None):
+                with patch("time.monotonic", side_effect=[0.0, 1.0, 3.0, 5.5, 6.0]):
+                    res_wait = self.proc_mgr.handle_chest_reward_sequence(
+                        self.clean_screen, wait_for_chest=True
+                    )
+                    self.assertFalse(res_wait)
+                    # Debe haber intentado tomar capturas periódicas esperando que aparezca el cofre
+                    self.assertGreaterEqual(self.mock_device.screenshot.call_count, 1)
+
+    def test_handle_chest_reward_sequence_fallback_when_not_village_ready(self):
+        """
+        Si wait_for_chest=True y tras 3.0s no aparece cofre ni Continue pero la aldea no está lista,
+        debe ejecutar los 4 taps de fallback al centro y esperar Continue.
+        """
+        with patch.object(self.proc_mgr, "is_village_ready", return_value=False):
+            def fake_find_any(img, tpls, **kwargs):
+                # Continue solo aparece tras dar los 4 taps al cofre
+                if tpls == self.proc_mgr.tpl_continue_btns and self.mock_device.tap.call_count >= 4:
+                    return ("continue", 1200, 800)
+                return None
+
+            self.mock_vision.find_any.side_effect = fake_find_any
+
+            time_val = 0.0
+            def fake_monotonic():
+                nonlocal time_val
+                t = time_val
+                time_val += 1.0
+                return t
+
+            with patch("time.sleep", return_value=None):
+                with patch("time.monotonic", side_effect=fake_monotonic):
+                    res = self.proc_mgr.handle_chest_reward_sequence(
+                        self.clean_screen, wait_for_chest=True
+                    )
+                    self.assertTrue(res, "Debe ejecutar fallback y reportar True")
+                    cx = int(self.mock_device.width * 0.50)
+                    cy = int(self.mock_device.height * 0.48)
+                    center_taps = [
+                        call for call in self.mock_device.tap.call_args_list
+                        if call[0] == (cx, cy)
+                    ]
+                    self.assertEqual(len(center_taps), 4, "Debe haber dado 4 taps al centro")
+                    self.mock_device.tap.assert_any_call(1200, 800)
 
     def test_chained_chest_wait_timeout_capped_at_2_5s(self):
         """
@@ -262,6 +299,16 @@ class TestStateMachineCoreStability(unittest.TestCase):
         self.sm.proc_mgr.handle_chest_reward_sequence.assert_called_once_with(wait_for_chest=True)
         # Debe haber llamado a _wait_and_tap_return_home para volver a la aldea
         self.sm._wait_and_tap_return_home.assert_called_once()
+
+    def test_wait_and_tap_return_home_exits_immediately_if_village_ready(self):
+        """
+        _wait_and_tap_return_home debe salir de inmediato si la aldea ya está lista,
+        evitando pulsaciones innecesarias o taps fantasma del UI cache.
+        """
+        self.sm.proc_mgr.is_village_ready = MagicMock(return_value=True)
+        ret = self.sm._wait_and_tap_return_home()
+        self.assertTrue(ret)
+        self.mock_device.tap.assert_not_called()
 
     def test_sneaky_farming_natural_end_does_not_surrender(self):
         """

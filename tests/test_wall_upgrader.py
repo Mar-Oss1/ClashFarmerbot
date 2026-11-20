@@ -382,7 +382,7 @@ class TestWallUpgraderFilters(unittest.TestCase):
         taps = [call[0] for call in self.mock_device.tap.call_args_list]
         self.assertEqual(taps[0], (1800, 100))
         self.assertEqual(taps[1], (1094, 249))  # Gold
-        self.assertEqual(taps[2], (1639, 502))  # Perm
+        self.assertEqual(taps[2], (1644, 541))  # Perm (calibrado)
         self.assertEqual(taps[3], (1800, 100))
         self.assertEqual(self.upgrader._session_filters, {"gold": True, "elixir": False, "perm": True})
 
@@ -398,7 +398,7 @@ class TestWallUpgraderFilters(unittest.TestCase):
         taps = [call[0] for call in self.mock_device.tap.call_args_list]
         self.assertEqual(taps[0], (1800, 100))
         self.assertEqual(taps[1], (1370, 249))  # Elixir
-        self.assertEqual(taps[2], (1639, 502))  # Perm
+        self.assertEqual(taps[2], (1644, 541))  # Perm (calibrado)
         self.assertEqual(taps[3], (1800, 100))
         self.assertEqual(self.upgrader._session_filters, {"gold": False, "elixir": True, "perm": True})
 
@@ -427,12 +427,11 @@ class TestWallUpgraderFilters(unittest.TestCase):
         with patch.object(self.upgrader, "detect_filter_states", return_value={"gold": True, "elixir": False, "perm": True}):
             self.upgrader._apply_filter("elixir")
 
-        self.assertEqual(self.mock_device.tap.call_count, 4)
+        self.assertEqual(self.mock_device.tap.call_count, 3)
         taps = [call[0] for call in self.mock_device.tap.call_args_list]
-        self.assertEqual(taps[0], (1800, 100))
-        self.assertEqual(taps[1], (1094, 249))  # Gold desactivar
-        self.assertEqual(taps[2], (1370, 249))  # Elixir activar
-        self.assertEqual(taps[3], (1800, 100))  # Cerrar
+        self.assertEqual(taps[0], (1800, 100))  # Abrir menú
+        self.assertEqual(taps[1], (1370, 249))  # Elixir activar (solo 1 tap de recurso)
+        self.assertEqual(taps[2], (1800, 100))  # Cerrar menú
         self.assertEqual(self.upgrader._session_filters, {"gold": False, "elixir": True, "perm": True})
 
     def test_reset_filter_cache(self):
@@ -573,6 +572,58 @@ class TestWallUpgraderTemplateAndMatching(unittest.TestCase):
         found = upgrader._find_and_tap_wall_in_list()
         self.assertFalse(found, "Nombre compuesto con letras adheridas debe ser rechazado")
         self.assertEqual(mock_device.tap.call_count, 0)
+
+    def test_find_and_tap_wall_accepts_wall_x_number_and_rejects_compound_and_warden(self):
+        """
+        Valida que 'Wall x 250' sea aceptado correctamente permitiendo el sufijo 'x N',
+        mientras que palabras compuestas como 'Wall Wrecker' y coincidencias falsas
+        como 'Grand Warden' sigan siendo rechazadas rigurosamente.
+        """
+        lbl = cv2.imread(os.path.join(PROJECT_ROOT, "assets", "buttons", "wall_label_generic.png"))
+        th, tw = lbl.shape[:2]
+
+        from core.vision import Vision
+
+        # 1. 'Wall x 250' SÍ debe ser aceptado
+        mock_device_wall_x = MagicMock()
+        mock_device_wall_x.width = 2400
+        mock_device_wall_x.height = 1080
+        screen_wall_x = np.zeros((1080, 2400, 3), dtype=np.uint8)
+        lx, ly = 1600, 400
+        screen_wall_x[ly:ly + th, lx:lx + tw] = lbl
+        cv2.putText(screen_wall_x, "x 250", (lx + tw + 4, ly + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+        mock_device_wall_x.screenshot.return_value = screen_wall_x
+
+        upgrader_wall_x = WallUpgrader(mock_device_wall_x, Vision())
+        found_wall_x = upgrader_wall_x._find_and_tap_wall_in_list()
+        self.assertTrue(found_wall_x, "'Wall x 250' debe ser aceptado")
+        self.assertEqual(mock_device_wall_x.tap.call_count, 1)
+
+        # 2. 'Wall Wrecker' DEBE ser rechazado
+        mock_device_wrecker = MagicMock()
+        mock_device_wrecker.width = 2400
+        mock_device_wrecker.height = 1080
+        screen_wrecker = np.zeros((1080, 2400, 3), dtype=np.uint8)
+        screen_wrecker[ly:ly + th, lx:lx + tw] = lbl
+        cv2.putText(screen_wrecker, "Wrecker", (lx + tw + 4, ly + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+        mock_device_wrecker.screenshot.return_value = screen_wrecker
+
+        upgrader_wrecker = WallUpgrader(mock_device_wrecker, Vision())
+        found_wrecker = upgrader_wrecker._find_and_tap_wall_in_list()
+        self.assertFalse(found_wrecker, "'Wall Wrecker' debe ser rechazado como palabra compuesta")
+        self.assertEqual(mock_device_wrecker.tap.call_count, 0)
+
+        # 3. 'Grand Warden' (sample_filters_off.jpg) DEBE ser rechazado
+        mock_device_warden = MagicMock()
+        mock_device_warden.width = 2400
+        mock_device_warden.height = 1080
+        fixture_path = os.path.join(PROJECT_ROOT, "tests", "fixtures", "sample_filters_off.jpg")
+        mock_device_warden.screenshot.return_value = cv2.imread(fixture_path)
+
+        upgrader_warden = WallUpgrader(mock_device_warden, Vision())
+        found_warden = upgrader_warden._find_and_tap_wall_in_list()
+        self.assertFalse(found_warden, "'Grand Warden' debe ser rechazado con umbral 0.82")
+        self.assertEqual(mock_device_warden.tap.call_count, 0)
 
 
 class TestCostEvaluation(unittest.TestCase):

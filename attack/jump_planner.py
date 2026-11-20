@@ -23,6 +23,7 @@ from vision.yolo_detector import Detection
 from vision.wall_raycast import (
     estimate_iso_angles,
     detect_global_wall_segments,
+    find_wall_crossings,
     find_wall_crossings_from_segments,
     draw_wall_raycast_debug,
     find_wall_junctions,
@@ -683,3 +684,15 @@ def compute_adaptive_jump_targets_from_detections(
         return _compute_legacy_quadrant_jump_targets(detections, screen_size)
 
     return _compute_cluster_intersection_jump_targets(detections, screen_size)
+
+
+def plan_flank_jump_crossings(
+    screen: np.ndarray,
+    p_drop: tuple[int, int],
+    p_target: tuple[int, int],
+    **kwargs,
+) -> list[tuple[int, int]]:
+    """
+    Calcula los puntos de cruce de muros para vistas de flanco delegando al planificador.
+    """
+    return find_wall_crossings(screen, p_drop, p_target, **kwargs)

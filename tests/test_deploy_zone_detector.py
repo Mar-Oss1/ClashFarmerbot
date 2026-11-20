@@ -18,7 +18,7 @@ class TestDeployZoneDetector(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.detector = get_deploy_zone_detector()
-        cls.test_img_path = os.path.join(PROJECT_ROOT, "scratch", "current_screen.png")
+        cls.test_img_path = os.path.join(PROJECT_ROOT, "tests", "fixtures", "current_screen.png")
         if os.path.exists(cls.test_img_path):
             cls.test_img = cv2.imread(cls.test_img_path)
         else:
